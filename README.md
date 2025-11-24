@@ -158,8 +158,8 @@ Input: 6 channels × 240×121 (padded to 256×128)
 │       256×128→128×64  │ Skip connection ─────────────────┐  │
 │                       │                                  │  │
 │ Enc2: 32→64 channels  │ Conv+ReLU → Conv+ReLU → MaxPool  │  │
-│       128×64→64×32    │ Skip connection ──────────────┐  │  │
-│                       │                               │  │  │
+│       128×64→64×32    │ Skip connection ─────────────=─┐ │  │
+│                       │                                │ │  │
 │ Enc3: 64→128 channels │ Conv+ReLU → Conv+ReLU → MaxPool│ │  │
 │       64×32→32×16     │ Skip connection ─────────-──┐  │ │  │
 └─────────────────────────────────────────────────────│──│─│──┘
