@@ -1,0 +1,222 @@
+!================================================================
+! Test Climate U-Net Model
+!================================================================
+program test_climate_unet
+    use cudafor
+    use iso_c_binding
+    use climate_unet_module
+    implicit none
+
+    type(c_ptr) :: cudnn_handle
+    integer :: tests_passed = 0, tests_failed = 0
+
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    integer :: stat
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Climate U-Net Test Suite"
+    print *, "=============================================="
+    print *, ""
+
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "cuDNN initialized"
+    print *, ""
+
+    call test_1_unet_init()
+    call test_2_unet_forward()
+    call test_3_unet_output_range()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Test Summary"
+    print *, "=============================================="
+    print '(A,I2,A)', "  Passed: ", tests_passed, " tests"
+    print '(A,I2,A)', "  Failed: ", tests_failed, " tests"
+    print *, "=============================================="
+
+    stat = cudnnDestroy(cudnn_handle)
+    if (tests_failed > 0) stop 1
+
+contains
+
+    !================================================================
+    ! Test 1: U-Net Initialization
+    !================================================================
+    subroutine test_1_unet_init()
+        type(climate_unet_t) :: model
+        logical :: passed
+
+        print *, "Test 1: U-Net initialization"
+
+        call unet_init(model, cudnn_handle, 4)
+
+        passed = .true.
+
+        if (.not. model%initialized) then
+            print *, "  FAIL: Model not initialized"
+            passed = .false.
+        endif
+
+        if (model%batch_size /= 4) then
+            print *, "  FAIL: Batch size incorrect"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: U-Net initialized successfully"
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        call unet_cleanup(model)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 2: U-Net Forward Pass
+    !================================================================
+    subroutine test_2_unet_forward()
+        type(climate_unet_t) :: model
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_input(:,:,:,:), h_output(:,:,:,:)
+        real(4) :: in_mean, out_mean
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 2: U-Net forward pass"
+
+        call unet_init(model, cudnn_handle, 4)
+
+        ! Climate data dimensions: batch=4, channels=6, 240x121
+        allocate(input(4, 6, 240, 121))
+        allocate(output(4, 6, 240, 121))
+        allocate(h_input(4, 6, 240, 121))
+        allocate(h_output(4, 6, 240, 121))
+
+        ! Random input
+        call random_number(h_input)
+        input = h_input
+
+        ! Forward pass
+        call unet_forward(model, input, output)
+        istat = cudaDeviceSynchronize()
+
+        h_output = output
+
+        in_mean = sum(h_input) / size(h_input)
+        out_mean = sum(h_output) / size(h_output)
+
+        passed = .true.
+
+        ! Check output shape matches input
+        if (size(h_output, 1) /= 4 .or. size(h_output, 2) /= 6 .or. &
+            size(h_output, 3) /= 240 .or. size(h_output, 4) /= 121) then
+            print *, "  FAIL: Output shape doesn't match input"
+            print *, "    Expected: (4, 6, 240, 121)"
+            print *, "    Got:     ", shape(h_output)
+            passed = .false.
+        endif
+
+        ! Check for NaN
+        if (out_mean /= out_mean) then
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        ! Check output is not all zeros
+        if (maxval(abs(h_output)) < 1e-10) then
+            print *, "  FAIL: Output is all zeros"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: U-Net forward produces valid output"
+            print '(A,F10.6)', "    Input mean:  ", in_mean
+            print '(A,F10.6)', "    Output mean: ", out_mean
+            print *, "    Shape:", shape(h_output)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, h_input, h_output)
+        call unet_cleanup(model)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 3: U-Net Output Range
+    !================================================================
+    subroutine test_3_unet_output_range()
+        type(climate_unet_t) :: model
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:)
+        real(4) :: out_min, out_max, out_std
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 3: U-Net output range"
+
+        call unet_init(model, cudnn_handle, 4)
+
+        allocate(input(4, 6, 240, 121))
+        allocate(output(4, 6, 240, 121))
+        allocate(h_output(4, 6, 240, 121))
+
+        ! Normalized input [0, 1]
+        input = 0.5
+
+        call unet_forward(model, input, output)
+        istat = cudaDeviceSynchronize()
+
+        h_output = output
+
+        out_min = minval(h_output)
+        out_max = maxval(h_output)
+        out_std = sqrt(sum((h_output - sum(h_output)/size(h_output))**2) / size(h_output))
+
+        passed = .true.
+
+        ! Output can be negative (no final ReLU) - that's expected for regression
+        ! Just check it's in a reasonable range
+        if (abs(out_max) > 100.0 .or. abs(out_min) > 100.0) then
+            print *, "  FAIL: Output values too extreme"
+            print *, "    Range: [", out_min, ", ", out_max, "]"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: U-Net output in reasonable range"
+            print '(A,F10.6,A,F10.6,A)', "    Range: [", out_min, ", ", out_max, "]"
+            print '(A,F10.6)', "    Std:   ", out_std
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, h_output)
+        call unet_cleanup(model)
+        print *, ""
+    end subroutine
+
+end program test_climate_unet

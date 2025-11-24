@@ -1,0 +1,374 @@
+!================================================================
+! U-Net Model Export Module
+!================================================================
+! Saves trained U-Net weights to binary files for Python loading.
+!
+! Export format matches PyTorch conventions:
+!   - Conv weights: (out_ch, in_ch, kH, kW) in F-order
+!   - Bias: (out_ch)
+!
+! Usage:
+!   use unet_export
+!   call export_unet_model(model, "saved_models/climate_unet/", loss, epoch)
+!
+! Output structure:
+!   saved_models/climate_unet/
+!     model_metadata.txt
+!     enc1_conv1_weights.bin, enc1_conv1_bias.bin
+!     enc1_conv2_weights.bin, enc1_conv2_bias.bin
+!     ... (all encoder, bottleneck, decoder, final layers)
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-23
+!================================================================
+
+module unet_export
+    use cudafor
+    use iso_c_binding
+    use climate_unet_module
+    use conv2d_cudnn
+    use unet_blocks
+    implicit none
+
+    private
+    public :: export_unet_model, export_unet_checkpoint
+    public :: export_sample_io  ! Export input/output for verification
+    public :: export_debug_activations  ! Export intermediate activations for debugging
+
+contains
+
+    !================================================================
+    ! Export 4D array (conv weights) to binary file in standard F-order
+    ! Fortran stores arrays in column-major (F-order).
+    ! Python loads with: np.fromfile(...).reshape(shape, order='F')
+    !================================================================
+    subroutine export_4d_array(array, filename)
+        real(4), device, intent(in) :: array(:,:,:,:)
+        character(len=*), intent(in) :: filename
+
+        real(4), allocatable :: host_array(:,:,:,:)
+        integer :: dims(4)
+
+        dims = shape(array)
+        allocate(host_array(dims(1), dims(2), dims(3), dims(4)))
+        host_array = array
+
+        ! Write in standard F-order (Fortran default)
+        open(unit=99, file=filename, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+
+        deallocate(host_array)
+    end subroutine export_4d_array
+
+    !================================================================
+    ! Export 1D array (bias) to binary file
+    !================================================================
+    subroutine export_1d_array(array, filename)
+        real(4), device, intent(in) :: array(:)
+        character(len=*), intent(in) :: filename
+
+        real(4), allocatable :: host_array(:)
+        integer :: n
+
+        n = size(array)
+        allocate(host_array(n))
+        host_array = array
+
+        open(unit=99, file=filename, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+
+        deallocate(host_array)
+    end subroutine export_1d_array
+
+    !================================================================
+    ! Export a single conv2d layer
+    !================================================================
+    subroutine export_conv2d_layer(layer, export_dir, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: export_dir, prefix
+
+        character(len=512) :: filepath
+
+        filepath = trim(export_dir) // trim(prefix) // "_weights.bin"
+        call export_4d_array(layer%weights, filepath)
+
+        filepath = trim(export_dir) // trim(prefix) // "_bias.bin"
+        call export_1d_array(layer%bias, filepath)
+
+    end subroutine export_conv2d_layer
+
+    !================================================================
+    ! Export encoder block (2 conv layers)
+    !================================================================
+    subroutine export_encoder_block(block, export_dir, prefix)
+        type(encoder_block_t), intent(in) :: block
+        character(len=*), intent(in) :: export_dir, prefix
+
+        call export_conv2d_layer(block%conv1, export_dir, trim(prefix)//"_conv1")
+        call export_conv2d_layer(block%conv2, export_dir, trim(prefix)//"_conv2")
+
+    end subroutine export_encoder_block
+
+    !================================================================
+    ! Export decoder block (2 conv layers)
+    !================================================================
+    subroutine export_decoder_block(block, export_dir, prefix)
+        type(decoder_block_t), intent(in) :: block
+        character(len=*), intent(in) :: export_dir, prefix
+
+        call export_conv2d_layer(block%conv1, export_dir, trim(prefix)//"_conv1")
+        call export_conv2d_layer(block%conv2, export_dir, trim(prefix)//"_conv2")
+
+    end subroutine export_decoder_block
+
+    !================================================================
+    ! Create export directory and write metadata
+    !================================================================
+    subroutine create_unet_export_dir(export_dir, loss, epoch)
+        character(len=*), intent(in) :: export_dir
+        real(4), intent(in) :: loss
+        integer, intent(in) :: epoch
+
+        character(len=256) :: cmd, metadata_file
+        integer :: unit_num
+
+        ! Create directory
+        cmd = "mkdir -p " // trim(export_dir)
+        call system(trim(cmd))
+
+        ! Write metadata
+        metadata_file = trim(export_dir) // "model_metadata.txt"
+        open(newunit=unit_num, file=metadata_file, status='replace')
+
+        write(unit_num, '(A)') "======================================================================"
+        write(unit_num, '(A)') "Climate U-Net Model Export - v28e"
+        write(unit_num, '(A)') "======================================================================"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "Architecture:"
+        write(unit_num, '(A)') "  Input:  6 channels x 240 lat x 121 lon (padded to 256x128)"
+        write(unit_num, '(A)') "  Output: 6 channels x 240 lat x 121 lon"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "  Encoder:"
+        write(unit_num, '(A)') "    enc1: 6->32, 256x128->128x64 (conv1: 6->32, conv2: 32->32)"
+        write(unit_num, '(A)') "    enc2: 32->64, 128x64->64x32 (conv1: 32->64, conv2: 64->64)"
+        write(unit_num, '(A)') "    enc3: 64->128, 64x32->32x16 (conv1: 64->128, conv2: 128->128)"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "  Bottleneck:"
+        write(unit_num, '(A)') "    bottleneck1: 128->256"
+        write(unit_num, '(A)') "    bottleneck2: 256->256"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "  Decoder:"
+        write(unit_num, '(A)') "    dec3: 256+128->128 (conv1: 384->128, conv2: 128->128)"
+        write(unit_num, '(A)') "    dec2: 128+64->64 (conv1: 192->64, conv2: 64->64)"
+        write(unit_num, '(A)') "    dec1: 64+32->32 (conv1: 96->32, conv2: 32->32)"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "  Final: 32->6 (1x1 conv, no ReLU)"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A,F10.6)') "Training Loss: ", loss
+        write(unit_num, '(A,I0)') "Epochs Trained: ", epoch
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "Files:"
+        write(unit_num, '(A)') "  Encoder: enc[1-3]_conv[1-2]_weights.bin, enc[1-3]_conv[1-2]_bias.bin"
+        write(unit_num, '(A)') "  Bottleneck: bottleneck[1-2]_weights.bin, bottleneck[1-2]_bias.bin"
+        write(unit_num, '(A)') "  Decoder: dec[1-3]_conv[1-2]_weights.bin, dec[1-3]_conv[1-2]_bias.bin"
+        write(unit_num, '(A)') "  Final: final_weights.bin, final_bias.bin"
+        write(unit_num, '(A)') ""
+        write(unit_num, '(A)') "Weight format: Fortran F-order (out_ch, in_ch, kH, kW)"
+        write(unit_num, '(A)') "Load in Python with: np.fromfile(f, dtype=np.float32).reshape(shape, order='F')"
+        write(unit_num, '(A)') "======================================================================"
+
+        close(unit_num)
+
+        print *, "Created export directory: ", trim(export_dir)
+
+    end subroutine create_unet_export_dir
+
+    !================================================================
+    ! Export complete U-Net model
+    !================================================================
+    subroutine export_unet_model(model, export_dir, loss, epoch)
+        type(climate_unet_t), intent(in) :: model
+        character(len=*), intent(in) :: export_dir
+        real(4), intent(in) :: loss
+        integer, intent(in) :: epoch
+
+        print *, ""
+        print *, "======================================================================"
+        print *, "Exporting U-Net Model"
+        print *, "======================================================================"
+
+        ! Create directory and metadata
+        call create_unet_export_dir(export_dir, loss, epoch)
+
+        ! Export encoders
+        print *, "  Exporting encoder blocks..."
+        call export_encoder_block(model%enc1, export_dir, "enc1")
+        call export_encoder_block(model%enc2, export_dir, "enc2")
+        call export_encoder_block(model%enc3, export_dir, "enc3")
+
+        ! Export bottleneck
+        print *, "  Exporting bottleneck..."
+        call export_conv2d_layer(model%bottleneck1, export_dir, "bottleneck1")
+        call export_conv2d_layer(model%bottleneck2, export_dir, "bottleneck2")
+
+        ! Export decoders
+        print *, "  Exporting decoder blocks..."
+        call export_decoder_block(model%dec3, export_dir, "dec3")
+        call export_decoder_block(model%dec2, export_dir, "dec2")
+        call export_decoder_block(model%dec1, export_dir, "dec1")
+
+        ! Export final conv
+        print *, "  Exporting final conv..."
+        call export_conv2d_layer(model%final_conv, export_dir, "final")
+
+        print *, ""
+        print *, "Model export complete!"
+        print *, "======================================================================"
+        print *, ""
+
+    end subroutine export_unet_model
+
+    !================================================================
+    ! Export checkpoint (weights + optimizer state) - simplified version
+    ! For now just exports weights; optimizer state can be added later
+    !================================================================
+    subroutine export_unet_checkpoint(model, checkpoint_dir, loss, epoch)
+        type(climate_unet_t), intent(in) :: model
+        character(len=*), intent(in) :: checkpoint_dir
+        real(4), intent(in) :: loss
+        integer, intent(in) :: epoch
+
+        character(len=512) :: epoch_dir
+        character(len=16) :: epoch_str
+
+        write(epoch_str, '(I0.4)') epoch
+        epoch_dir = trim(checkpoint_dir) // "epoch_" // trim(epoch_str) // "/"
+
+        call export_unet_model(model, epoch_dir, loss, epoch)
+
+    end subroutine export_unet_checkpoint
+
+    !================================================================
+    ! Export sample input/output for verification
+    ! Saves one batch of input and corresponding output
+    ! NOTE: Tensors are in (W,H,C,N) order - F-order storage matches cuDNN C-order
+    !================================================================
+    subroutine export_sample_io(input, output, export_dir, sample_id)
+        real(4), device, intent(in) :: input(:,:,:,:)   ! (121, 240, 6, batch) = (W,H,C,N)
+        real(4), device, intent(in) :: output(:,:,:,:)  ! (121, 240, 6, batch) = (W,H,C,N)
+        character(len=*), intent(in) :: export_dir
+        integer, intent(in) :: sample_id
+
+        real(4), allocatable :: h_input(:,:,:,:), h_output(:,:,:,:)
+        character(len=512) :: filepath
+        character(len=16) :: id_str
+        integer :: dims(4)
+
+        write(id_str, '(I0.4)') sample_id
+
+        ! Export input (first sample only) - extract N=1 slice
+        dims = shape(input)
+        allocate(h_input(dims(1), dims(2), dims(3), 1))
+        h_input(:,:,:,1) = input(:,:,:,1)
+
+        filepath = trim(export_dir) // "sample_" // trim(id_str) // "_input.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) h_input
+        close(99)
+        deallocate(h_input)
+
+        ! Export output (first sample only) - extract N=1 slice
+        dims = shape(output)
+        allocate(h_output(dims(1), dims(2), dims(3), 1))
+        h_output(:,:,:,1) = output(:,:,:,1)
+
+        filepath = trim(export_dir) // "sample_" // trim(id_str) // "_output.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) h_output
+        close(99)
+        deallocate(h_output)
+
+        print '(A,I0,A)', "  Exported sample ", sample_id, " input/output for verification"
+
+    end subroutine export_sample_io
+
+    !================================================================
+    ! Export intermediate activations for debugging
+    ! Call after a forward pass with the model's internal tensors
+    ! NOTE: Tensors are in (W,H,C,N) order - F-order storage matches cuDNN C-order
+    !================================================================
+    subroutine export_debug_activations(model, export_dir)
+        type(climate_unet_t), intent(in) :: model
+        character(len=*), intent(in) :: export_dir
+
+        real(4), allocatable :: host_array(:,:,:,:)
+        real(4), allocatable :: host_full(:,:,:,:)  ! Full batch for proper D2H transfer
+        character(len=512) :: filepath
+        integer :: dims(4)
+
+        print *, "Exporting debug activations..."
+
+        ! Export padded input (W=128, H=256, C=6, N=batch) in (W,H,C,N) order
+        ! First copy full device array to host, then extract first sample (N=1)
+        dims = shape(model%padded_input)
+        allocate(host_full(dims(1), dims(2), dims(3), dims(4)))
+        host_full = model%padded_input  ! Full D2H transfer
+        allocate(host_array(dims(1), dims(2), dims(3), 1))
+        host_array(:,:,:,1) = host_full(:,:,:,1)  ! Extract first sample on host
+        deallocate(host_full)
+        filepath = trim(export_dir) // "debug_padded_input.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+        print *, "  Exported padded_input: ", dims
+        deallocate(host_array)
+
+        ! Export enc1.conv1_out (after first conv only) (W=128, H=256, C=32, N=batch)
+        dims = shape(model%enc1%conv1_out)
+        allocate(host_full(dims(1), dims(2), dims(3), dims(4)))
+        host_full = model%enc1%conv1_out  ! Full D2H transfer
+        allocate(host_array(dims(1), dims(2), dims(3), 1))
+        host_array(:,:,:,1) = host_full(:,:,:,1)  ! Extract first sample on host
+        deallocate(host_full)
+        filepath = trim(export_dir) // "debug_enc1_conv1_out.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+        print *, "  Exported enc1_conv1_out: ", dims
+        deallocate(host_array)
+
+        ! Export skip1 (before pooling, after enc1 convs) (W=128, H=256, C=32, N=batch)
+        dims = shape(model%skip1)
+        allocate(host_full(dims(1), dims(2), dims(3), dims(4)))
+        host_full = model%skip1  ! Full D2H transfer
+        allocate(host_array(dims(1), dims(2), dims(3), 1))
+        host_array(:,:,:,1) = host_full(:,:,:,1)
+        deallocate(host_full)
+        filepath = trim(export_dir) // "debug_skip1.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+        print *, "  Exported skip1: ", dims
+        deallocate(host_array)
+
+        ! Export enc1_out (after pooling) (W=64, H=128, C=32, N=batch)
+        dims = shape(model%enc1_out)
+        allocate(host_full(dims(1), dims(2), dims(3), dims(4)))
+        host_full = model%enc1_out  ! Full D2H transfer
+        allocate(host_array(dims(1), dims(2), dims(3), 1))
+        host_array(:,:,:,1) = host_full(:,:,:,1)
+        deallocate(host_full)
+        filepath = trim(export_dir) // "debug_enc1_out.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+        print *, "  Exported enc1_out: ", dims
+        deallocate(host_array)
+
+        print *, "Debug activations exported!"
+
+    end subroutine export_debug_activations
+
+end module unet_export

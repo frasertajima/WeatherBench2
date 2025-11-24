@@ -1,0 +1,349 @@
+!================================================================
+! Test U-Net Encoder and Decoder Blocks
+!================================================================
+program test_unet_blocks
+    use cudafor
+    use iso_c_binding
+    use unet_blocks
+    implicit none
+
+    type(c_ptr) :: cudnn_handle
+    integer :: tests_passed = 0, tests_failed = 0
+
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    integer :: stat
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  U-Net Blocks Test Suite"
+    print *, "=============================================="
+    print *, ""
+
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "cuDNN initialized"
+    print *, ""
+
+    call test_1_encoder_dims()
+    call test_2_encoder_forward()
+    call test_3_decoder_dims()
+    call test_4_decoder_forward()
+    call test_5_encoder_decoder_chain()
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Test Summary"
+    print *, "=============================================="
+    print '(A,I2,A)', "  Passed: ", tests_passed, " tests"
+    print '(A,I2,A)', "  Failed: ", tests_failed, " tests"
+    print *, "=============================================="
+
+    stat = cudnnDestroy(cudnn_handle)
+    if (tests_failed > 0) stop 1
+
+contains
+
+    !================================================================
+    ! Test 1: Encoder Dimensions
+    !================================================================
+    subroutine test_1_encoder_dims()
+        type(encoder_block_t) :: enc
+        logical :: passed
+
+        print *, "Test 1: Encoder block dimensions"
+
+        ! 64x64 input, 3->32 channels, should output 32x32
+        call encoder_init(enc, cudnn_handle, 3, 32, 8, 64, 64)
+
+        passed = .true.
+
+        if (enc%out_height /= 32 .or. enc%out_width /= 32) then
+            print *, "  FAIL: Expected output 32x32, got", enc%out_height, "x", enc%out_width
+            passed = .false.
+        endif
+
+        if (enc%out_channels /= 32) then
+            print *, "  FAIL: Expected 32 output channels, got", enc%out_channels
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Encoder 64x64 -> 32x32 (3->32 channels)"
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        call encoder_cleanup(enc)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 2: Encoder Forward Pass
+    !================================================================
+    subroutine test_2_encoder_forward()
+        type(encoder_block_t) :: enc
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), device, allocatable :: skip(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:), h_skip(:,:,:,:)
+        real(4) :: out_mean, skip_mean
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 2: Encoder forward pass"
+
+        call encoder_init(enc, cudnn_handle, 3, 32, 8, 64, 64)
+
+        allocate(input(8, 3, 64, 64))
+        allocate(output(8, 32, 32, 32))
+        allocate(skip(8, 32, 64, 64))
+        allocate(h_output(8, 32, 32, 32))
+        allocate(h_skip(8, 32, 64, 64))
+
+        input = 0.5
+
+        call encoder_forward(enc, input, output, skip)
+        istat = cudaDeviceSynchronize()
+
+        h_output = output
+        h_skip = skip
+
+        out_mean = sum(h_output) / size(h_output)
+        skip_mean = sum(h_skip) / size(h_skip)
+
+        passed = .true.
+
+        ! Check output dimensions
+        if (size(h_output, 3) /= 32 .or. size(h_output, 4) /= 32) then
+            print *, "  FAIL: Output spatial size incorrect"
+            passed = .false.
+        endif
+
+        ! Check skip dimensions
+        if (size(h_skip, 3) /= 64 .or. size(h_skip, 4) /= 64) then
+            print *, "  FAIL: Skip spatial size incorrect"
+            passed = .false.
+        endif
+
+        ! Check for NaN
+        if (out_mean /= out_mean .or. skip_mean /= skip_mean) then
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        ! Check outputs are non-negative (ReLU)
+        if (minval(h_output) < -1e-6 .or. minval(h_skip) < -1e-6) then
+            print *, "  FAIL: ReLU outputs have negative values"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Encoder forward produces valid outputs"
+            print '(A,F10.6)', "    Output mean: ", out_mean
+            print '(A,F10.6)', "    Skip mean:   ", skip_mean
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, skip, h_output, h_skip)
+        call encoder_cleanup(enc)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 3: Decoder Dimensions
+    !================================================================
+    subroutine test_3_decoder_dims()
+        type(decoder_block_t) :: dec
+        logical :: passed
+
+        print *, "Test 3: Decoder block dimensions"
+
+        ! 32x32 input with 64 channels, skip with 32 channels, output 64x64 with 32 channels
+        call decoder_init(dec, cudnn_handle, 64, 32, 32, 8, 32, 32)
+
+        passed = .true.
+
+        if (dec%out_height /= 64 .or. dec%out_width /= 64) then
+            print *, "  FAIL: Expected output 64x64, got", dec%out_height, "x", dec%out_width
+            passed = .false.
+        endif
+
+        if (dec%out_channels /= 32) then
+            print *, "  FAIL: Expected 32 output channels, got", dec%out_channels
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Decoder 32x32 -> 64x64 (64+32->32 channels)"
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        call decoder_cleanup(dec)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 4: Decoder Forward Pass
+    !================================================================
+    subroutine test_4_decoder_forward()
+        type(decoder_block_t) :: dec
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: skip(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:)
+        real(4) :: out_mean
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 4: Decoder forward pass"
+
+        ! 32x32 input (64ch) + 64x64 skip (32ch) -> 64x64 output (32ch)
+        call decoder_init(dec, cudnn_handle, 64, 32, 32, 8, 32, 32)
+
+        allocate(input(8, 64, 32, 32))
+        allocate(skip(8, 32, 64, 64))
+        allocate(output(8, 32, 64, 64))
+        allocate(h_output(8, 32, 64, 64))
+
+        input = 0.5
+        skip = 0.3
+
+        call decoder_forward(dec, input, skip, output)
+        istat = cudaDeviceSynchronize()
+
+        h_output = output
+        out_mean = sum(h_output) / size(h_output)
+
+        passed = .true.
+
+        ! Check output dimensions
+        if (size(h_output, 3) /= 64 .or. size(h_output, 4) /= 64) then
+            print *, "  FAIL: Output spatial size incorrect"
+            passed = .false.
+        endif
+
+        ! Check for NaN
+        if (out_mean /= out_mean) then
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        ! Check outputs are non-negative (ReLU)
+        if (minval(h_output) < -1e-6) then
+            print *, "  FAIL: ReLU output has negative values"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Decoder forward produces valid output"
+            print '(A,F10.6)', "    Output mean: ", out_mean
+            print *, "    Shape:", shape(h_output)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, skip, output, h_output)
+        call decoder_cleanup(dec)
+        print *, ""
+    end subroutine
+
+    !================================================================
+    ! Test 5: Encoder-Decoder Chain
+    !================================================================
+    subroutine test_5_encoder_decoder_chain()
+        type(encoder_block_t) :: enc
+        type(decoder_block_t) :: dec
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: encoded(:,:,:,:)
+        real(4), device, allocatable :: skip(:,:,:,:)
+        real(4), device, allocatable :: decoded(:,:,:,:)
+        real(4), allocatable :: h_input(:,:,:,:), h_decoded(:,:,:,:)
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 5: Encoder-Decoder chain"
+
+        ! Encoder: 64x64 (6ch) -> 32x32 (32ch) + skip 64x64 (32ch)
+        call encoder_init(enc, cudnn_handle, 6, 32, 8, 64, 64)
+
+        ! Decoder: 32x32 (32ch) + skip 64x64 (32ch) -> 64x64 (6ch)
+        call decoder_init(dec, cudnn_handle, 32, 32, 6, 8, 32, 32)
+
+        allocate(input(8, 6, 64, 64))
+        allocate(encoded(8, 32, 32, 32))
+        allocate(skip(8, 32, 64, 64))
+        allocate(decoded(8, 6, 64, 64))
+        allocate(h_input(8, 6, 64, 64))
+        allocate(h_decoded(8, 6, 64, 64))
+
+        ! Random input
+        call random_number(h_input)
+        input = h_input
+
+        ! Forward through encoder
+        call encoder_forward(enc, input, encoded, skip)
+        istat = cudaDeviceSynchronize()
+
+        ! Forward through decoder
+        call decoder_forward(dec, encoded, skip, decoded)
+        istat = cudaDeviceSynchronize()
+
+        h_decoded = decoded
+
+        passed = .true.
+
+        ! Check output has same spatial size as input
+        if (size(h_decoded, 3) /= 64 .or. size(h_decoded, 4) /= 64) then
+            print *, "  FAIL: Output spatial size doesn't match input"
+            passed = .false.
+        endif
+
+        ! Check output has same channels as input
+        if (size(h_decoded, 2) /= 6) then
+            print *, "  FAIL: Output channels don't match input"
+            passed = .false.
+        endif
+
+        ! Check for NaN
+        if (sum(h_decoded) /= sum(h_decoded)) then
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Encoder-Decoder chain preserves dimensions"
+            print *, "    64x64x6 -> 32x32x32 -> 64x64x6"
+            print '(A,F10.6)', "    Output mean: ", sum(h_decoded)/size(h_decoded)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, encoded, skip, decoded, h_input, h_decoded)
+        call encoder_cleanup(enc)
+        call decoder_cleanup(dec)
+        print *, ""
+    end subroutine
+
+end program test_unet_blocks

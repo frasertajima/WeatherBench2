@@ -1,0 +1,406 @@
+!================================================================
+! Streaming Regression Data Loader Module - v28d
+!================================================================
+! Variant of streaming_data_loader for REGRESSION tasks where
+! both inputs and outputs are continuous float arrays of the
+! same dimension.
+!
+! Key Differences from Classification Loader:
+!   - Outputs are real(4) arrays, not integer labels
+!   - Output has same dimension as input (feature_size)
+!   - Reads from two parallel binary files: inputs + outputs
+!
+! Usage:
+!   1. call regression_streaming_init(input_file, output_file, ...)
+!   2. call regression_streaming_start_epoch()
+!   3. call regression_streaming_get_batch(batch_in, batch_out, n)
+!   4. call regression_streaming_cleanup()
+!
+! Author: v28d Streaming Team
+! Date: 2025-11-22
+!================================================================
+module streaming_regression_loader
+    use cudafor
+    use omp_lib
+    implicit none
+
+    !----------------------------------------------------------------
+    ! Shuffle mode options (same as classification loader)
+    !----------------------------------------------------------------
+    integer, parameter, public :: REG_SHUFFLE_NONE = 0
+    integer, parameter, public :: REG_SHUFFLE_BLOCK = 1
+    integer, parameter, public :: REG_SHUFFLE_FULL = 2
+
+    integer, parameter :: DEFAULT_BLOCK_SIZE = 50
+
+    !----------------------------------------------------------------
+    ! Double buffer structure for regression
+    !----------------------------------------------------------------
+    type :: reg_buffer_t
+        real(4), managed, allocatable :: inputs(:,:)   ! (feature_size, batch_size)
+        real(4), managed, allocatable :: outputs(:,:)  ! (feature_size, batch_size)
+        integer :: batch_idx
+        logical :: ready
+    end type reg_buffer_t
+
+    !----------------------------------------------------------------
+    ! Module state
+    !----------------------------------------------------------------
+    type(reg_buffer_t), target, private :: reg_buffer_a, reg_buffer_b
+    type(reg_buffer_t), pointer, private :: reg_current_buffer => null()
+    type(reg_buffer_t), pointer, private :: reg_loading_buffer => null()
+
+    integer, private :: reg_input_unit = 200
+    integer, private :: reg_output_unit = 201
+    character(len=512), private :: reg_input_filename
+    character(len=512), private :: reg_output_filename
+
+    integer(8), private :: reg_total_samples
+    integer, private :: reg_batch_size
+    integer, private :: reg_feature_size
+    integer(8), private :: reg_bytes_per_sample
+    integer(8), private :: reg_bytes_per_batch
+    integer, private :: reg_total_batches
+
+    integer, private :: reg_current_batch_idx
+    integer, allocatable, private :: reg_batch_order(:)
+
+    integer, private :: reg_shuffle_mode = REG_SHUFFLE_BLOCK
+    integer, private :: reg_block_size = DEFAULT_BLOCK_SIZE
+    logical, private :: reg_is_initialized = .false.
+    logical, private :: reg_files_open = .false.
+
+    public :: regression_streaming_init
+    public :: regression_streaming_start_epoch
+    public :: regression_streaming_get_batch
+    public :: regression_streaming_cleanup
+    public :: regression_streaming_set_shuffle_mode
+    public :: regression_streaming_get_num_batches
+    public :: regression_streaming_is_initialized
+
+contains
+
+    !================================================================
+    ! Initialize regression streaming loader
+    !================================================================
+    subroutine regression_streaming_init(input_file, output_file, num_samples, feat_size, batch_sz)
+        character(len=*), intent(in) :: input_file, output_file
+        integer(8), intent(in) :: num_samples
+        integer, intent(in) :: feat_size, batch_sz
+
+        integer :: istat
+        logical :: input_exists, output_exists
+
+        if (reg_is_initialized) then
+            call regression_streaming_cleanup()
+        endif
+
+        ! Check files exist
+        inquire(file=input_file, exist=input_exists)
+        inquire(file=output_file, exist=output_exists)
+
+        if (.not. input_exists) then
+            print *, ""
+            print *, "ERROR: Input streaming file not found!"
+            print *, "  Missing: ", trim(input_file)
+            stop 1
+        endif
+        if (.not. output_exists) then
+            print *, ""
+            print *, "ERROR: Output streaming file not found!"
+            print *, "  Missing: ", trim(output_file)
+            stop 1
+        endif
+
+        ! Store parameters
+        reg_input_filename = input_file
+        reg_output_filename = output_file
+        reg_total_samples = num_samples
+        reg_feature_size = feat_size
+        reg_batch_size = batch_sz
+
+        ! Calculate sizes
+        reg_bytes_per_sample = int(feat_size, 8) * 4  ! float32
+        reg_bytes_per_batch = int(batch_sz, 8) * reg_bytes_per_sample
+        reg_total_batches = int((num_samples + batch_sz - 1) / batch_sz)
+
+        ! Allocate double buffers - (feature_size, batch_size)
+        allocate(reg_buffer_a%inputs(feat_size, batch_sz), stat=istat)
+        allocate(reg_buffer_a%outputs(feat_size, batch_sz), stat=istat)
+        allocate(reg_buffer_b%inputs(feat_size, batch_sz), stat=istat)
+        allocate(reg_buffer_b%outputs(feat_size, batch_sz), stat=istat)
+
+        if (istat /= 0) then
+            print *, "ERROR: Failed to allocate regression streaming buffers"
+            return
+        endif
+
+        reg_buffer_a%ready = .false.
+        reg_buffer_a%batch_idx = 0
+        reg_buffer_b%ready = .false.
+        reg_buffer_b%batch_idx = 0
+
+        allocate(reg_batch_order(reg_total_batches))
+
+        reg_current_buffer => reg_buffer_a
+        reg_loading_buffer => reg_buffer_b
+
+        reg_is_initialized = .true.
+
+        print *, ""
+        print *, "=========================================="
+        print *, "  Regression Streaming Loader Initialized"
+        print *, "=========================================="
+        print '(A, A)', "  Input file:     ", trim(input_file)
+        print '(A, A)', "  Output file:    ", trim(output_file)
+        print '(A, I12)', "  Total samples:  ", reg_total_samples
+        print '(A, I12)', "  Feature size:   ", reg_feature_size
+        print '(A, I12)', "  Batch size:     ", reg_batch_size
+        print '(A, I12)', "  Total batches:  ", reg_total_batches
+        print '(A, F8.2, A)', "  Buffer memory:  ", &
+              real(4 * reg_bytes_per_batch) / (1024.0**2), " MB"
+        print *, "=========================================="
+        print *, ""
+
+    end subroutine regression_streaming_init
+
+    !================================================================
+    ! Start new epoch
+    !================================================================
+    subroutine regression_streaming_start_epoch()
+        integer :: i, j, temp, block_idx, num_blocks
+        real(4) :: r
+        type(reg_buffer_t), pointer :: temp_ptr
+
+        if (.not. reg_is_initialized) then
+            print *, "ERROR: Regression streaming not initialized"
+            return
+        endif
+
+        ! Close files if open
+        if (reg_files_open) then
+            close(reg_input_unit)
+            close(reg_output_unit)
+        endif
+
+        ! Open files
+        open(unit=reg_input_unit, file=trim(reg_input_filename), form='unformatted', &
+             access='stream', status='old')
+        open(unit=reg_output_unit, file=trim(reg_output_filename), form='unformatted', &
+             access='stream', status='old')
+        reg_files_open = .true.
+
+        ! Initialize batch order
+        do i = 1, reg_total_batches
+            reg_batch_order(i) = i
+        end do
+
+        ! Shuffle based on mode
+        select case (reg_shuffle_mode)
+        case (REG_SHUFFLE_NONE)
+            ! Sequential
+
+        case (REG_SHUFFLE_BLOCK)
+            num_blocks = (reg_total_batches + reg_block_size - 1) / reg_block_size
+            do block_idx = num_blocks, 2, -1
+                call random_number(r)
+                j = 1 + int(r * real(block_idx))
+                do i = 1, reg_block_size
+                    if ((block_idx - 1) * reg_block_size + i <= reg_total_batches .and. &
+                        (j - 1) * reg_block_size + i <= reg_total_batches) then
+                        temp = reg_batch_order((block_idx - 1) * reg_block_size + i)
+                        reg_batch_order((block_idx - 1) * reg_block_size + i) = &
+                            reg_batch_order((j - 1) * reg_block_size + i)
+                        reg_batch_order((j - 1) * reg_block_size + i) = temp
+                    endif
+                end do
+            end do
+
+        case (REG_SHUFFLE_FULL)
+            do i = reg_total_batches, 2, -1
+                call random_number(r)
+                j = 1 + int(r * real(i))
+                temp = reg_batch_order(i)
+                reg_batch_order(i) = reg_batch_order(j)
+                reg_batch_order(j) = temp
+            end do
+        end select
+
+        ! Reset state
+        reg_current_batch_idx = 0
+        reg_current_buffer => reg_buffer_a
+        reg_loading_buffer => reg_buffer_b
+        reg_buffer_a%ready = .false.
+        reg_buffer_b%ready = .false.
+
+        ! Pre-load first batch
+        call reg_load_batch_sync(reg_current_buffer, reg_batch_order(1))
+        reg_current_buffer%ready = .true.
+        reg_current_batch_idx = 1
+
+        ! Start async load of second batch
+        if (reg_total_batches > 1) then
+            call reg_load_batch_sync(reg_loading_buffer, reg_batch_order(2))
+            reg_loading_buffer%ready = .true.
+        endif
+
+    end subroutine regression_streaming_start_epoch
+
+    !================================================================
+    ! Get next batch
+    !================================================================
+    subroutine regression_streaming_get_batch(batch_inputs, batch_outputs, actual_batch_size)
+        real(4), managed, intent(out) :: batch_inputs(:,:)
+        real(4), managed, intent(out) :: batch_outputs(:,:)
+        integer, intent(out) :: actual_batch_size
+
+        type(reg_buffer_t), pointer :: temp_ptr
+        integer :: next_batch_idx
+
+        if (.not. reg_is_initialized) then
+            print *, "ERROR: Regression streaming not initialized"
+            actual_batch_size = 0
+            return
+        endif
+
+        if (reg_current_batch_idx > reg_total_batches) then
+            actual_batch_size = 0
+            return
+        endif
+
+        ! Wait for buffer
+        do while (.not. reg_current_buffer%ready)
+        end do
+
+        ! Calculate actual batch size
+        if (reg_current_batch_idx == reg_total_batches) then
+            actual_batch_size = int(mod(reg_total_samples - 1, int(reg_batch_size, 8)) + 1)
+        else
+            actual_batch_size = reg_batch_size
+        endif
+
+        ! Copy data
+        batch_inputs(:, 1:actual_batch_size) = reg_current_buffer%inputs(:, 1:actual_batch_size)
+        batch_outputs(:, 1:actual_batch_size) = reg_current_buffer%outputs(:, 1:actual_batch_size)
+
+        ! Advance
+        reg_current_batch_idx = reg_current_batch_idx + 1
+
+        ! Swap buffers
+        temp_ptr => reg_current_buffer
+        reg_current_buffer => reg_loading_buffer
+        reg_loading_buffer => temp_ptr
+        reg_loading_buffer%ready = .false.
+
+        ! Async load next batch
+        next_batch_idx = reg_current_batch_idx + 1
+        if (next_batch_idx <= reg_total_batches) then
+            !$omp parallel sections num_threads(2)
+            !$omp section
+            !$omp section
+            call reg_load_batch_sync(reg_loading_buffer, reg_batch_order(next_batch_idx))
+            reg_loading_buffer%ready = .true.
+            !$omp end parallel sections
+        endif
+
+    end subroutine regression_streaming_get_batch
+
+    !================================================================
+    ! Load batch synchronously (internal)
+    !================================================================
+    subroutine reg_load_batch_sync(buf, batch_idx)
+        type(reg_buffer_t), intent(inout) :: buf
+        integer, intent(in) :: batch_idx
+
+        integer(8) :: file_pos
+        integer(8) :: samples_before, samples_in_batch
+        integer :: istat
+
+        samples_before = int(batch_idx - 1, 8) * int(reg_batch_size, 8)
+        if (samples_before + reg_batch_size <= reg_total_samples) then
+            samples_in_batch = reg_batch_size
+        else
+            samples_in_batch = reg_total_samples - samples_before
+        endif
+
+        file_pos = samples_before * reg_bytes_per_sample + 1
+
+        ! Initialize buffers
+        buf%inputs = 0.0
+        buf%outputs = 0.0
+
+        ! Read inputs
+        read(reg_input_unit, pos=file_pos, iostat=istat) buf%inputs(:, 1:int(samples_in_batch))
+        if (istat /= 0 .and. istat /= -1) then
+            print *, "WARNING: Error reading batch", batch_idx, "inputs, iostat=", istat
+        endif
+
+        ! Read outputs (same position, different file)
+        read(reg_output_unit, pos=file_pos, iostat=istat) buf%outputs(:, 1:int(samples_in_batch))
+        if (istat /= 0 .and. istat /= -1) then
+            print *, "WARNING: Error reading batch", batch_idx, "outputs, iostat=", istat
+        endif
+
+        buf%batch_idx = batch_idx
+
+    end subroutine reg_load_batch_sync
+
+    !================================================================
+    ! Set shuffle mode
+    !================================================================
+    subroutine regression_streaming_set_shuffle_mode(mode, blk_size)
+        integer, intent(in) :: mode
+        integer, intent(in), optional :: blk_size
+
+        reg_shuffle_mode = mode
+        if (present(blk_size)) then
+            reg_block_size = blk_size
+        endif
+
+    end subroutine regression_streaming_set_shuffle_mode
+
+    !================================================================
+    ! Get number of batches
+    !================================================================
+    function regression_streaming_get_num_batches() result(num)
+        integer :: num
+        num = reg_total_batches
+    end function regression_streaming_get_num_batches
+
+    !================================================================
+    ! Check if initialized
+    !================================================================
+    function regression_streaming_is_initialized() result(initialized)
+        logical :: initialized
+        initialized = reg_is_initialized
+    end function regression_streaming_is_initialized
+
+    !================================================================
+    ! Cleanup
+    !================================================================
+    subroutine regression_streaming_cleanup()
+
+        if (.not. reg_is_initialized) return
+
+        if (reg_files_open) then
+            close(reg_input_unit)
+            close(reg_output_unit)
+            reg_files_open = .false.
+        endif
+
+        if (allocated(reg_buffer_a%inputs)) deallocate(reg_buffer_a%inputs)
+        if (allocated(reg_buffer_a%outputs)) deallocate(reg_buffer_a%outputs)
+        if (allocated(reg_buffer_b%inputs)) deallocate(reg_buffer_b%inputs)
+        if (allocated(reg_buffer_b%outputs)) deallocate(reg_buffer_b%outputs)
+        if (allocated(reg_batch_order)) deallocate(reg_batch_order)
+
+        nullify(reg_current_buffer)
+        nullify(reg_loading_buffer)
+
+        reg_is_initialized = .false.
+
+        print *, "Regression streaming loader cleaned up"
+
+    end subroutine regression_streaming_cleanup
+
+end module streaming_regression_loader

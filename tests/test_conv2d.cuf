@@ -1,0 +1,524 @@
+!================================================================
+! Test Conv2D Layer
+!================================================================
+! Tests the conv2d_cudnn module for correctness.
+!
+! Tests:
+!   1. Initialization and output dimensions
+!   2. Forward pass produces reasonable output
+!   3. Backward pass computes gradients
+!   4. Adam update modifies weights
+!   5. Multiple layers chain correctly
+!
+! Usage:
+!   ./test_conv2d
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-22
+!================================================================
+program test_conv2d
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    implicit none
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! Test results
+    integer :: tests_passed = 0
+    integer :: tests_failed = 0
+
+    ! cuDNN create interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    integer :: stat
+
+    print *, ""
+    print *, "=============================================="
+    print *, "  Conv2D Layer Test Suite"
+    print *, "=============================================="
+    print *, ""
+
+    ! Initialize cuDNN
+    stat = cudnnCreate(cudnn_handle)
+    if (stat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    endif
+    print *, "cuDNN initialized"
+    print *, ""
+
+    ! Run tests
+    call test_1_initialization()
+    call test_2_forward_pass()
+    call test_3_backward_pass()
+    call test_4_adam_update()
+    call test_5_layer_chain()
+    call test_6_conv_with_relu()
+
+    ! Summary
+    print *, ""
+    print *, "=============================================="
+    print *, "  Test Summary"
+    print *, "=============================================="
+    print '(A,I2,A)', "  Passed: ", tests_passed, " tests"
+    print '(A,I2,A)', "  Failed: ", tests_failed, " tests"
+    print *, "=============================================="
+
+    ! Cleanup
+    stat = cudnnDestroy(cudnn_handle)
+
+    if (tests_failed > 0) stop 1
+
+contains
+
+    !================================================================
+    ! Test 1: Initialization and Output Dimensions
+    !================================================================
+    subroutine test_1_initialization()
+        type(conv2d_layer_t) :: layer
+        logical :: passed
+
+        print *, "Test 1: Initialization and dimensions"
+
+        ! Create layer: 3 input channels, 32 output, 3x3 kernel, pad=1, stride=1
+        ! Input: 32x32, Output should be: (32 + 2*1 - 3)/1 + 1 = 32
+        call conv2d_init(layer, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32)
+
+        passed = .true.
+
+        ! Check dimensions
+        if (layer%out_height /= 32) then
+            print *, "  FAIL: Expected out_height=32, got", layer%out_height
+            passed = .false.
+        endif
+
+        if (layer%out_width /= 32) then
+            print *, "  FAIL: Expected out_width=32, got", layer%out_width
+            passed = .false.
+        endif
+
+        ! Check weight dimensions
+        if (size(layer%weights, 1) /= 32 .or. &
+            size(layer%weights, 2) /= 3 .or. &
+            size(layer%weights, 3) /= 3 .or. &
+            size(layer%weights, 4) /= 3) then
+            print *, "  FAIL: Weight dimensions incorrect"
+            print *, "    Expected: (32, 3, 3, 3)"
+            print *, "    Got:", shape(layer%weights)
+            passed = .false.
+        endif
+
+        if (size(layer%bias) /= 32) then
+            print *, "  FAIL: Bias size incorrect, expected 32, got", size(layer%bias)
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Dimensions correct"
+            print *, "    Output: ", layer%out_height, "x", layer%out_width
+            print *, "    Weights: ", shape(layer%weights)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        call conv2d_cleanup(layer)
+        print *, ""
+
+    end subroutine test_1_initialization
+
+    !================================================================
+    ! Test 2: Forward Pass
+    !================================================================
+    subroutine test_2_forward_pass()
+        type(conv2d_layer_t) :: layer
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:)
+        real(4) :: out_mean, out_std, out_min, out_max
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 2: Forward pass"
+
+        ! Create layer
+        call conv2d_init(layer, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32)
+
+        ! Allocate input/output (NCHW format)
+        allocate(input(16, 3, 32, 32))
+        allocate(output(16, 32, 32, 32))
+        allocate(h_output(16, 32, 32, 32))
+
+        ! Initialize input with random values [0, 1]
+        call random_number(h_output(1:16, 1:3, 1:32, 1:32))  ! Reuse h_output temporarily
+        input = h_output(1:16, 1:3, 1:32, 1:32)
+
+        ! Forward pass
+        call conv2d_forward(layer, input, output)
+        istat = cudaDeviceSynchronize()
+
+        ! Copy output to host
+        h_output = output
+
+        ! Compute statistics
+        out_mean = sum(h_output) / size(h_output)
+        out_std = sqrt(sum((h_output - out_mean)**2) / size(h_output))
+        out_min = minval(h_output)
+        out_max = maxval(h_output)
+
+        passed = .true.
+
+        ! Check output is not all zeros or NaN
+        if (abs(out_mean) < 1e-10 .and. out_std < 1e-10) then
+            print *, "  FAIL: Output appears to be all zeros"
+            passed = .false.
+        endif
+
+        if (out_mean /= out_mean) then  ! NaN check
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Forward pass produces valid output"
+            print '(A,F10.6)', "    Mean:  ", out_mean
+            print '(A,F10.6)', "    Std:   ", out_std
+            print '(A,F10.6,A,F10.6)', "    Range: [", out_min, ", ", out_max, "]"
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, h_output)
+        call conv2d_cleanup(layer)
+        print *, ""
+
+    end subroutine test_2_forward_pass
+
+    !================================================================
+    ! Test 3: Backward Pass
+    !================================================================
+    subroutine test_3_backward_pass()
+        type(conv2d_layer_t) :: layer
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), device, allocatable :: grad_output(:,:,:,:)
+        real(4), device, allocatable :: grad_input(:,:,:,:)
+        real(4), allocatable :: h_grad_weights(:,:,:,:)
+        real(4), allocatable :: h_grad_bias(:)
+        real(4), allocatable :: h_grad_input(:,:,:,:)
+        real(4) :: grad_w_norm, grad_b_norm, grad_in_norm
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 3: Backward pass"
+
+        ! Create layer
+        call conv2d_init(layer, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32)
+
+        ! Allocate tensors
+        allocate(input(16, 3, 32, 32))
+        allocate(output(16, 32, 32, 32))
+        allocate(grad_output(16, 32, 32, 32))
+        allocate(grad_input(16, 3, 32, 32))
+        allocate(h_grad_weights(32, 3, 3, 3))
+        allocate(h_grad_bias(32))
+        allocate(h_grad_input(16, 3, 32, 32))
+
+        ! Initialize with random data
+        input = 0.5
+        grad_output = 0.1
+
+        ! Forward pass (needed for backward)
+        call conv2d_forward(layer, input, output)
+        istat = cudaDeviceSynchronize()
+
+        ! Backward pass
+        call conv2d_backward(layer, input, output, grad_output, grad_input)
+        istat = cudaDeviceSynchronize()
+
+        ! Copy gradients to host
+        h_grad_weights = layer%grad_weights
+        h_grad_bias = layer%grad_bias
+        h_grad_input = grad_input
+
+        ! Compute gradient norms
+        grad_w_norm = sqrt(sum(h_grad_weights**2))
+        grad_b_norm = sqrt(sum(h_grad_bias**2))
+        grad_in_norm = sqrt(sum(h_grad_input**2))
+
+        passed = .true.
+
+        ! Check gradients are non-zero
+        if (grad_w_norm < 1e-10) then
+            print *, "  FAIL: Weight gradients are zero"
+            passed = .false.
+        endif
+
+        if (grad_b_norm < 1e-10) then
+            print *, "  FAIL: Bias gradients are zero"
+            passed = .false.
+        endif
+
+        if (grad_in_norm < 1e-10) then
+            print *, "  FAIL: Input gradients are zero"
+            passed = .false.
+        endif
+
+        ! Check for NaN
+        if (grad_w_norm /= grad_w_norm .or. grad_b_norm /= grad_b_norm .or. grad_in_norm /= grad_in_norm) then
+            print *, "  FAIL: Gradients contain NaN"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Backward pass computes non-zero gradients"
+            print '(A,E12.4)', "    grad_weights norm: ", grad_w_norm
+            print '(A,E12.4)', "    grad_bias norm:    ", grad_b_norm
+            print '(A,E12.4)', "    grad_input norm:   ", grad_in_norm
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, grad_output, grad_input)
+        deallocate(h_grad_weights, h_grad_bias, h_grad_input)
+        call conv2d_cleanup(layer)
+        print *, ""
+
+    end subroutine test_3_backward_pass
+
+    !================================================================
+    ! Test 4: Adam Update
+    !================================================================
+    subroutine test_4_adam_update()
+        type(conv2d_layer_t) :: layer
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), device, allocatable :: grad_output(:,:,:,:)
+        real(4), device, allocatable :: grad_input(:,:,:,:)
+        real(4), allocatable :: h_weights_before(:,:,:,:)
+        real(4), allocatable :: h_weights_after(:,:,:,:)
+        real(4) :: weight_change
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 4: Adam update"
+
+        ! Create layer
+        call conv2d_init(layer, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32)
+
+        ! Allocate tensors
+        allocate(input(16, 3, 32, 32))
+        allocate(output(16, 32, 32, 32))
+        allocate(grad_output(16, 32, 32, 32))
+        allocate(grad_input(16, 3, 32, 32))
+        allocate(h_weights_before(32, 3, 3, 3))
+        allocate(h_weights_after(32, 3, 3, 3))
+
+        input = 0.5
+        grad_output = 0.1
+
+        ! Save weights before
+        h_weights_before = layer%weights
+
+        ! Forward and backward
+        call conv2d_forward(layer, input, output)
+        call conv2d_backward(layer, input, output, grad_output, grad_input)
+        istat = cudaDeviceSynchronize()
+
+        ! Update weights
+        call conv2d_update(layer, 0.001, 1)
+        istat = cudaDeviceSynchronize()
+
+        ! Get weights after
+        h_weights_after = layer%weights
+
+        ! Check weights changed
+        weight_change = sqrt(sum((h_weights_after - h_weights_before)**2))
+
+        passed = .true.
+
+        if (weight_change < 1e-10) then
+            print *, "  FAIL: Weights did not change after update"
+            passed = .false.
+        endif
+
+        if (weight_change /= weight_change) then
+            print *, "  FAIL: Weights contain NaN after update"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Adam update modifies weights"
+            print '(A,E12.4)', "    Weight change norm: ", weight_change
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, grad_output, grad_input)
+        deallocate(h_weights_before, h_weights_after)
+        call conv2d_cleanup(layer)
+        print *, ""
+
+    end subroutine test_4_adam_update
+
+    !================================================================
+    ! Test 5: Layer Chain
+    !================================================================
+    subroutine test_5_layer_chain()
+        type(conv2d_layer_t) :: layer1, layer2
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: hidden(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:)
+        real(4) :: out_mean
+        logical :: passed
+        integer :: istat
+
+        print *, "Test 5: Layer chain (two conv layers)"
+
+        ! Create two layers: 3->32->64 channels
+        call conv2d_init(layer1, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32)
+        call conv2d_init(layer2, cudnn_handle, 32, 64, 3, 1, 1, 16, 32, 32)
+
+        ! Allocate tensors
+        allocate(input(16, 3, 32, 32))
+        allocate(hidden(16, 32, 32, 32))
+        allocate(output(16, 64, 32, 32))
+        allocate(h_output(16, 64, 32, 32))
+
+        ! Initialize input
+        input = 0.5
+
+        ! Forward through both layers
+        call conv2d_forward(layer1, input, hidden)
+        call conv2d_forward(layer2, hidden, output)
+        istat = cudaDeviceSynchronize()
+
+        ! Check output
+        h_output = output
+        out_mean = sum(h_output) / size(h_output)
+
+        passed = .true.
+
+        if (abs(out_mean) < 1e-10 .and. maxval(abs(h_output)) < 1e-10) then
+            print *, "  FAIL: Output is all zeros"
+            passed = .false.
+        endif
+
+        if (out_mean /= out_mean) then
+            print *, "  FAIL: Output contains NaN"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Two-layer chain produces valid output"
+            print '(A,F10.6)', "    Output mean: ", out_mean
+            print *, "    Shape: ", shape(h_output)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, hidden, output, h_output)
+        call conv2d_cleanup(layer1)
+        call conv2d_cleanup(layer2)
+        print *, ""
+
+    end subroutine test_5_layer_chain
+
+    !================================================================
+    ! Test 6: Conv2D with ReLU
+    !================================================================
+    subroutine test_6_conv_with_relu()
+        type(conv2d_layer_t) :: layer
+        real(4), device, allocatable :: input(:,:,:,:)
+        real(4), device, allocatable :: output(:,:,:,:)
+        real(4), allocatable :: h_output(:,:,:,:)
+        real(4) :: out_min, negative_count
+        logical :: passed
+        integer :: istat, i
+
+        print *, "Test 6: Conv2D with ReLU activation"
+
+        ! Create layer with ReLU
+        call conv2d_init(layer, cudnn_handle, 3, 32, 3, 1, 1, 16, 32, 32, use_relu=.true.)
+
+        ! Check ReLU is enabled
+        if (.not. layer%use_relu) then
+            print *, "  FAIL: use_relu not set"
+            tests_failed = tests_failed + 1
+            return
+        endif
+
+        ! Allocate tensors
+        allocate(input(16, 3, 32, 32))
+        allocate(output(16, 32, 32, 32))
+        allocate(h_output(16, 32, 32, 32))
+
+        ! Initialize input with values that will produce some negative pre-relu outputs
+        input = 0.5
+
+        ! Forward pass
+        call conv2d_forward(layer, input, output)
+        istat = cudaDeviceSynchronize()
+
+        ! Copy output to host
+        h_output = output
+
+        ! Check that all outputs are >= 0 (ReLU property)
+        out_min = minval(h_output)
+        negative_count = count(h_output < 0.0)
+
+        passed = .true.
+
+        if (out_min < -1e-6) then
+            print *, "  FAIL: ReLU output has negative values"
+            print *, "    Min value:", out_min
+            passed = .false.
+        endif
+
+        if (negative_count > 0) then
+            print *, "  FAIL: Found", int(negative_count), "negative values"
+            passed = .false.
+        endif
+
+        ! Check output is not all zeros (some should be positive)
+        if (maxval(h_output) < 1e-10) then
+            print *, "  FAIL: ReLU output is all zeros"
+            passed = .false.
+        endif
+
+        if (passed) then
+            print *, "  PASS: Conv2D+ReLU produces non-negative output"
+            print '(A,F10.6)', "    Min:  ", out_min
+            print '(A,F10.6)', "    Max:  ", maxval(h_output)
+            print '(A,F10.6)', "    Mean: ", sum(h_output)/size(h_output)
+            tests_passed = tests_passed + 1
+        else
+            tests_failed = tests_failed + 1
+        endif
+
+        deallocate(input, output, h_output)
+        call conv2d_cleanup(layer)
+        print *, ""
+
+    end subroutine test_6_conv_with_relu
+
+end program test_conv2d

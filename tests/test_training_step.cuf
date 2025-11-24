@@ -1,0 +1,386 @@
+!================================================================
+! Training Step Verification Test
+!================================================================
+! Runs a single training step and exports all data for PyTorch comparison:
+!   - Initial weights
+!   - Input/target batch
+!   - Forward output
+!   - Loss value
+!   - Gradients
+!   - Updated weights
+!   - TIMING for performance comparison
+!
+! Usage:
+!   ./test_training_step
+!
+! Output:
+!   training_verify/initial_weights/   - Weights before training
+!   training_verify/step_data/         - All step data for verification
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-23
+!================================================================
+
+program test_training_step
+    use cudafor
+    use iso_c_binding
+    use conv2d_cudnn
+    use climate_unet_module
+    use unet_export
+    implicit none
+
+    ! cuDNN interface
+    interface
+        function cudnnCreate(handle) bind(c, name='cudnnCreate')
+            import :: c_ptr, c_int
+            type(c_ptr), intent(out) :: handle
+            integer(c_int) :: cudnnCreate
+        end function
+        function cudnnDestroy(handle) bind(c, name='cudnnDestroy')
+            import :: c_ptr, c_int
+            type(c_ptr), value :: handle
+            integer(c_int) :: cudnnDestroy
+        end function
+    end interface
+
+    ! Model and data
+    type(climate_unet_t) :: model
+    real(4), device, allocatable :: input_padded(:,:,:,:)   ! (128,256,6,batch)
+    real(4), device, allocatable :: target_padded(:,:,:,:)
+    real(4), device, allocatable :: output_padded(:,:,:,:)
+    real(4), device, allocatable :: grad_padded(:,:,:,:)
+
+    ! Host arrays for data generation
+    real(4), allocatable :: h_input(:,:,:,:), h_target(:,:,:,:)
+
+    ! Parameters (PADDED_WIDTH/HEIGHT come from climate_unet_module)
+    integer, parameter :: BATCH_SIZE = 8
+    integer, parameter :: CHANNELS = 6
+    real(4), parameter :: LEARNING_RATE = 0.0001
+    integer, parameter :: TIMESTEP = 1
+
+    ! Timing
+    real(4) :: t_forward, t_backward, t_update
+    type(cudaEvent) :: start_event, stop_event
+    integer :: istat
+
+    ! Loss computation
+    real(4) :: loss, sum_sq, diff, scale
+    real(4), allocatable :: h_out(:,:,:,:), h_tgt(:,:,:,:), h_grad(:,:,:,:)
+    integer :: total_elements
+
+    ! cuDNN handle
+    type(c_ptr) :: cudnn_handle
+
+    ! Random seed for reproducibility
+    integer :: seed_size
+    integer, allocatable :: seed(:)
+
+    ! Loop variables
+    integer :: w, h, c, b
+    real(4) :: val
+
+    print *, "======================================================================"
+    print *, "Training Step Verification Test"
+    print *, "======================================================================"
+    print *, ""
+    print *, "Configuration:"
+    print *, "  Batch size:     ", BATCH_SIZE
+    print *, "  Padded shape:   ", PADDED_WIDTH, "x", PADDED_HEIGHT, "x", CHANNELS
+    print *, "  Learning rate:  ", LEARNING_RATE
+    print *, "  Timestep:       ", TIMESTEP
+    print *, ""
+
+    ! Set random seed for reproducibility
+    call random_seed(size=seed_size)
+    allocate(seed(seed_size))
+    seed = 42
+    call random_seed(put=seed)
+    deallocate(seed)
+
+    ! Initialize cuDNN
+    istat = cudnnCreate(cudnn_handle)
+    if (istat /= 0) then
+        print *, "ERROR: Failed to create cuDNN handle"
+        stop 1
+    end if
+    print *, "cuDNN initialized"
+
+    ! Create CUDA events for timing
+    istat = cudaEventCreate(start_event)
+    istat = cudaEventCreate(stop_event)
+
+    ! Allocate padded tensors (W,H,C,N order)
+    allocate(input_padded(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(target_padded(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(output_padded(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(grad_padded(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+
+    ! Allocate host arrays
+    allocate(h_input(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(h_target(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+
+    ! Generate deterministic test data
+    print *, "Generating deterministic test data..."
+    do b = 1, BATCH_SIZE
+        do c = 1, CHANNELS
+            do h = 1, PADDED_HEIGHT
+                do w = 1, PADDED_WIDTH
+                    val = sin(real(w)*0.1) * cos(real(h)*0.1) * real(c+1) * 0.1
+                    h_input(w,h,c,b) = val + real(b-1)*0.01
+                    h_target(w,h,c,b) = val * 1.05 + 0.02 + real(b-1)*0.01
+                end do
+            end do
+        end do
+    end do
+
+    ! Copy to device
+    input_padded = h_input
+    target_padded = h_target
+
+    ! Initialize model
+    print *, "Initializing U-Net model..."
+    call unet_init(model, cudnn_handle, BATCH_SIZE)
+    print *, "  Model initialized"
+
+    ! Create export directories
+    call system("mkdir -p training_verify/initial_weights/")
+    call system("mkdir -p training_verify/step_data/")
+    call system("mkdir -p training_verify/updated_weights/")
+
+    ! Export initial weights
+    print *, ""
+    print *, "Exporting initial weights..."
+    call export_unet_model(model, "training_verify/initial_weights/", 0.0, 0)
+
+    ! Export input/target data
+    print *, "Exporting input/target batch..."
+    call export_device_4d(input_padded, "training_verify/step_data/input_padded.bin")
+    call export_device_4d(target_padded, "training_verify/step_data/target_padded.bin")
+
+    ! Warm-up run (not timed)
+    print *, ""
+    print *, "Warm-up run..."
+    call unet_forward(model, input_padded, output_padded)
+    istat = cudaDeviceSynchronize()
+
+    ! Reset random seed and reinitialize weights for reproducible timed run
+    call random_seed(size=seed_size)
+    allocate(seed(seed_size))
+    seed = 42
+    call random_seed(put=seed)
+    deallocate(seed)
+
+    ! Reinitialize model with fresh weights
+    call unet_cleanup(model)
+    call unet_init(model, cudnn_handle, BATCH_SIZE)
+
+    print *, ""
+    print *, "======================================================================"
+    print *, "TIMED TRAINING STEP"
+    print *, "======================================================================"
+
+    ! ============================================
+    ! FORWARD PASS (timed)
+    ! ============================================
+    istat = cudaEventRecord(start_event, 0)
+
+    call unet_forward(model, input_padded, output_padded)
+
+    istat = cudaEventRecord(stop_event, 0)
+    istat = cudaEventSynchronize(stop_event)
+    istat = cudaEventElapsedTime(t_forward, start_event, stop_event)
+
+    print '(A,F10.3,A)', "  Forward pass:  ", t_forward, " ms"
+
+    ! ============================================
+    ! LOSS COMPUTATION (on host for simplicity)
+    ! ============================================
+    allocate(h_out(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(h_tgt(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+    allocate(h_grad(PADDED_WIDTH, PADDED_HEIGHT, CHANNELS, BATCH_SIZE))
+
+    h_out = output_padded
+    h_tgt = target_padded
+
+    total_elements = PADDED_WIDTH * PADDED_HEIGHT * CHANNELS * BATCH_SIZE
+    scale = 2.0 / real(total_elements)
+
+    sum_sq = 0.0
+    do b = 1, BATCH_SIZE
+        do c = 1, CHANNELS
+            do h = 1, PADDED_HEIGHT
+                do w = 1, PADDED_WIDTH
+                    diff = h_out(w,h,c,b) - h_tgt(w,h,c,b)
+                    sum_sq = sum_sq + diff * diff
+                    h_grad(w,h,c,b) = scale * diff
+                end do
+            end do
+        end do
+    end do
+    loss = sum_sq / real(total_elements)
+
+    ! Copy gradient to device
+    grad_padded = h_grad
+
+    print '(A,F12.6)', "  Loss value:    ", loss
+
+    ! ============================================
+    ! BACKWARD PASS (timed)
+    ! ============================================
+    istat = cudaEventRecord(start_event, 0)
+
+    call unet_backward(model, input_padded, output_padded, grad_padded)
+
+    istat = cudaEventRecord(stop_event, 0)
+    istat = cudaEventSynchronize(stop_event)
+    istat = cudaEventElapsedTime(t_backward, start_event, stop_event)
+
+    print '(A,F10.3,A)', "  Backward pass: ", t_backward, " ms"
+
+    ! ============================================
+    ! ADAM UPDATE (timed)
+    ! ============================================
+    istat = cudaEventRecord(start_event, 0)
+
+    call unet_update(model, LEARNING_RATE, TIMESTEP)
+
+    istat = cudaEventRecord(stop_event, 0)
+    istat = cudaEventSynchronize(stop_event)
+    istat = cudaEventElapsedTime(t_update, start_event, stop_event)
+
+    print '(A,F10.3,A)', "  Adam update:   ", t_update, " ms"
+
+    print *, ""
+    print '(A,F10.3,A)', "  TOTAL (GPU):   ", t_forward + t_backward + t_update, " ms"
+    print *, ""
+
+    ! ============================================
+    ! Export all step data
+    ! ============================================
+    print *, "======================================================================"
+    print *, "Exporting step data for verification..."
+    print *, "======================================================================"
+
+    ! Export forward output
+    call export_device_4d(output_padded, "training_verify/step_data/forward_output_padded.bin")
+
+    ! Export loss gradient
+    call export_device_4d(grad_padded, "training_verify/step_data/grad_output_padded.bin")
+
+    ! Export loss value
+    open(unit=99, file="training_verify/step_data/loss.txt", status='replace')
+    write(99, '(E20.12)') loss
+    close(99)
+
+    ! Export timing
+    open(unit=99, file="training_verify/step_data/timing_fortran.txt", status='replace')
+    write(99, '(A,F12.3)') "forward_ms: ", t_forward
+    write(99, '(A,F12.3)') "backward_ms: ", t_backward
+    write(99, '(A,F12.3)') "update_ms: ", t_update
+    write(99, '(A,F12.3)') "total_gpu_ms: ", t_forward + t_backward + t_update
+    close(99)
+
+    ! Export hyperparameters
+    open(unit=99, file="training_verify/step_data/hyperparams.txt", status='replace')
+    write(99, '(A,E20.12)') "learning_rate: ", LEARNING_RATE
+    write(99, '(A,I0)') "timestep: ", TIMESTEP
+    write(99, '(A,I0)') "batch_size: ", BATCH_SIZE
+    write(99, '(A,E20.12)') "adam_beta1: ", 0.9
+    write(99, '(A,E20.12)') "adam_beta2: ", 0.999
+    write(99, '(A,E20.12)') "adam_epsilon: ", 1.0e-8
+    close(99)
+
+    ! Export updated weights
+    print *, "  Exporting updated weights..."
+    call export_unet_model(model, "training_verify/updated_weights/", loss, 1)
+
+    ! Export gradients for each layer
+    print *, "  Exporting gradients..."
+    call export_layer_gradients(model%enc1%conv1, "training_verify/step_data/", "enc1_conv1")
+    call export_layer_gradients(model%enc1%conv2, "training_verify/step_data/", "enc1_conv2")
+    call export_layer_gradients(model%bottleneck1, "training_verify/step_data/", "bottleneck1")
+    call export_layer_gradients(model%final_conv, "training_verify/step_data/", "final")
+
+    print *, ""
+    print *, "======================================================================"
+    print *, "VERIFICATION DATA EXPORT COMPLETE"
+    print *, "======================================================================"
+    print *, ""
+    print *, "Output directories:"
+    print *, "  training_verify/initial_weights/  - Weights before training"
+    print *, "  training_verify/step_data/        - Input, output, gradients, timing"
+    print *, "  training_verify/updated_weights/  - Weights after one Adam step"
+    print *, ""
+    print *, "To verify with PyTorch:"
+    print *, "  cd inference"
+    print *, "  python verify_training_step.py ../training_verify/"
+    print *, ""
+
+    ! Cleanup
+    call unet_cleanup(model)
+    deallocate(input_padded, target_padded, output_padded, grad_padded)
+    deallocate(h_input, h_target, h_out, h_tgt, h_grad)
+    istat = cudaEventDestroy(start_event)
+    istat = cudaEventDestroy(stop_event)
+    istat = cudnnDestroy(cudnn_handle)
+
+    print *, "Test complete!"
+
+contains
+
+    !================================================================
+    ! Export device 4D array to binary file
+    !================================================================
+    subroutine export_device_4d(d_array, filename)
+        real(4), device, intent(in) :: d_array(:,:,:,:)
+        character(len=*), intent(in) :: filename
+
+        real(4), allocatable :: h_array(:,:,:,:)
+        integer :: dims(4)
+
+        dims = shape(d_array)
+        allocate(h_array(dims(1), dims(2), dims(3), dims(4)))
+        h_array = d_array
+
+        open(unit=99, file=filename, form='unformatted', access='stream', status='replace')
+        write(99) h_array
+        close(99)
+
+        deallocate(h_array)
+    end subroutine export_device_4d
+
+    !================================================================
+    ! Export conv2d layer gradients
+    !================================================================
+    subroutine export_layer_gradients(layer, export_dir, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: export_dir, prefix
+
+        character(len=512) :: filepath
+        real(4), allocatable :: h_4d(:,:,:,:), h_1d(:)
+        integer :: dims(4), n
+
+        ! Export weight gradients
+        dims = shape(layer%grad_weights)
+        allocate(h_4d(dims(1), dims(2), dims(3), dims(4)))
+        h_4d = layer%grad_weights
+        filepath = trim(export_dir) // trim(prefix) // "_grad_weights.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) h_4d
+        close(99)
+        deallocate(h_4d)
+
+        ! Export bias gradients
+        n = size(layer%grad_bias)
+        allocate(h_1d(n))
+        h_1d = layer%grad_bias
+        filepath = trim(export_dir) // trim(prefix) // "_grad_bias.bin"
+        open(unit=99, file=filepath, form='unformatted', access='stream', status='replace')
+        write(99) h_1d
+        close(99)
+        deallocate(h_1d)
+
+    end subroutine export_layer_gradients
+
+end program test_training_step

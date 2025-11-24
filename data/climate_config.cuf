@@ -1,0 +1,333 @@
+!================================================================
+! Climate Prediction Dataset Configuration
+!================================================================
+! Configuration for WeatherBench2 climate/weather prediction.
+!
+! This is a REGRESSION task (MSE loss), not classification.
+! Input: Weather state at time t
+! Output: Weather state at time t+lead_time (6 hours)
+!
+! Dataset: WeatherBench2 ERA5 reanalysis
+! Variables: z500, t850, u850, v850, t2m, msl (6 channels)
+! Resolution: 240 x 121 (lat x lon)
+! Training: 1979-2016 (55,519 samples)
+! Testing: 2017-2020 (5,843 samples)
+!================================================================
+module dataset_config
+    use cudafor
+    use streaming_regression_loader
+    use cmdline_args
+    implicit none
+
+    !================================================================
+    ! DATASET PARAMETERS - FROM metadata.json
+    !================================================================
+    ! Updated 2025-11-22 from prepare_climate_streaming.py output
+
+    integer, parameter, public :: train_samples = 55519    ! 1979-2016
+    integer, parameter, public :: test_samples = 5843      ! 2017-2020
+
+    ! Spatial dimensions (from metadata.json spatial_shape: [240, 121])
+    integer, parameter, public :: N_CHANNELS = 6           ! z500, t850, u850, v850, t2m, msl
+    integer, parameter, public :: LAT = 240                ! Latitude points
+    integer, parameter, public :: LON = 121                ! Longitude points
+
+    ! Derived parameters
+    integer, parameter, public :: input_size = N_CHANNELS * LAT * LON  ! 174,240
+    integer, parameter, public :: output_size = input_size             ! Same for prediction
+
+    ! For compatibility with existing code structure
+    integer, parameter, public :: num_classes = output_size  ! Regression outputs
+    integer, parameter, public :: INPUT_CHANNELS = N_CHANNELS
+    integer, parameter, public :: INPUT_HEIGHT = LAT
+    integer, parameter, public :: INPUT_WIDTH = LON
+
+    ! Data directories
+    character(len=*), parameter :: DATA_DIR = 'climate_data_streaming/'
+    character(len=*), parameter, public :: DATASET_NAME = 'WeatherBench2-Climate'
+
+    !================================================================
+    ! NORMALIZATION STATISTICS (from metadata.json)
+    !================================================================
+    ! Per-channel mean and std for denormalization if needed
+    real(4), parameter, public :: NORM_MEAN(6) = (/ &
+        54087.94,  &  ! z500 - geopotential 500hPa
+        274.40,    &  ! t850 - temperature 850hPa
+        1.41,      &  ! u850 - u-wind 850hPa
+        0.14,      &  ! v850 - v-wind 850hPa
+        278.25,    &  ! t2m  - 2m temperature
+        100957.92  &  ! msl  - mean sea level pressure
+    /)
+    real(4), parameter, public :: NORM_STD(6) = (/ &
+        3367.38,   &  ! z500
+        15.70,     &  ! t850
+        8.06,      &  ! u850
+        6.16,      &  ! v850
+        21.42,     &  ! t2m
+        1329.69    &  ! msl
+    /)
+
+    !================================================================
+    ! CNN ARCHITECTURE PARAMETERS
+    !================================================================
+    ! For weather prediction, we want to preserve spatial resolution
+    ! Using an encoder-decoder (U-Net like) architecture
+
+    ! Encoder
+    integer, parameter, public :: CONV1_FILTERS = 32
+    integer, parameter, public :: CONV2_FILTERS = 64
+    integer, parameter, public :: CONV3_FILTERS = 128
+    integer, parameter, public :: CONV4_FILTERS = 256
+
+    ! Decoder (mirrors encoder)
+    integer, parameter, public :: DECONV4_FILTERS = 128
+    integer, parameter, public :: DECONV3_FILTERS = 64
+    integer, parameter, public :: DECONV2_FILTERS = 32
+    integer, parameter, public :: DECONV1_FILTERS = N_CHANNELS  ! Output channels
+
+    integer, parameter, public :: KERNEL_SIZE = 3
+    integer, parameter, public :: PADDING = 1
+    integer, parameter, public :: STRIDE = 1
+
+    ! Pooling (for encoder) - use stride=2 conv instead for decoder
+    integer, parameter, public :: POOL_SIZE = 2
+    integer, parameter, public :: POOL_STRIDE = 2
+
+    !================================================================
+    ! TRAINING PARAMETERS
+    !================================================================
+    integer, parameter, public :: DEFAULT_BATCH_SIZE = 32
+    real(4), parameter, public :: DEFAULT_LEARNING_RATE = 0.001
+
+    !================================================================
+    ! GPU MEMORY FOR DATASET
+    !================================================================
+    ! For streaming mode, only test data is in memory
+    ! For full RAM mode, both train and test (requires ~80GB!)
+    real(4), managed, allocatable, public :: gpu_train_inputs(:,:)
+    real(4), managed, allocatable, public :: gpu_train_outputs(:,:)
+    real(4), managed, allocatable, public :: gpu_test_inputs(:,:)
+    real(4), managed, allocatable, public :: gpu_test_outputs(:,:)
+
+    ! Streaming mode state
+    logical, public :: streaming_mode_active = .false.
+    logical :: data_loaded = .false.
+
+    public :: load_dataset, is_data_loaded
+    public :: dataset_start_epoch, dataset_get_batch, dataset_cleanup
+
+contains
+
+    !================================================================
+    ! Load Dataset
+    !================================================================
+    subroutine load_dataset()
+        integer :: stat
+
+        call parse_cmdline_args()
+
+        if (show_help) then
+            call print_usage("climate_train")
+            stop
+        endif
+
+        streaming_mode_active = use_streaming
+
+        print *, "======================================================================"
+        if (streaming_mode_active) then
+            print *, "Loading Climate Dataset (STREAMING MODE)"
+        else
+            print *, "Loading Climate Dataset (Full RAM Mode)"
+        endif
+        print *, "======================================================================"
+        print '(A,I8)',       "   Training samples: ", train_samples
+        print '(A,I8)',       "   Test samples:     ", test_samples
+        print '(A,I8)',       "   Channels:         ", N_CHANNELS
+        print '(A,I4,A,I4)',  "   Spatial:          ", LAT, " x ", LON
+        print '(A,I8)',       "   Features/sample:  ", input_size
+        print '(A,F8.2,A)',   "   Train data size:  ", &
+              real(int(train_samples,8) * int(input_size,8) * 4 * 2) / (1024.0**3), " GB"
+
+        if (streaming_mode_active) then
+            print *, "   Mode:             STREAMING (recommended)"
+            call load_dataset_streaming()
+        else
+            print *, "   Mode:             FULL RAM (requires ~80GB!)"
+            call load_dataset_full_ram()
+        endif
+
+        data_loaded = .true.
+        print *, "======================================================================"
+        print *, ""
+
+    end subroutine load_dataset
+
+    !================================================================
+    ! Load in Full RAM Mode (requires ~80GB GPU memory!)
+    !================================================================
+    subroutine load_dataset_full_ram()
+        integer :: stat
+        real :: size_gb
+
+        size_gb = real(int(train_samples + test_samples, 8) * int(input_size, 8) * 4_8 * 2_8) / (1024.0**3)
+
+        print *, ""
+        print '(A,F8.2,A)', "   WARNING: Full RAM mode requires ", size_gb, " GB"
+        print *, "   Consider using --stream for large datasets"
+        print *, ""
+        print *, "Allocating managed memory..."
+
+        ! Training data (inputs and outputs)
+        allocate(gpu_train_inputs(train_samples, input_size), stat=stat)
+        if (stat /= 0) then
+            print *, "ERROR: Failed to allocate training inputs"
+            print *, "       Try using --stream mode instead"
+            stop 1
+        endif
+        allocate(gpu_train_outputs(train_samples, output_size), stat=stat)
+
+        ! Test data
+        allocate(gpu_test_inputs(test_samples, input_size), stat=stat)
+        allocate(gpu_test_outputs(test_samples, output_size), stat=stat)
+
+        print '(A,F8.2,A)', "   Allocated ", size_gb, " GB"
+
+        print *, ""
+        print *, "Loading training data..."
+
+        open(unit=10, file=DATA_DIR//'inputs_train_stream.bin', form='unformatted', &
+             access='stream', status='old', iostat=stat)
+        if (stat /= 0) then
+            print *, "ERROR: Cannot open training inputs"
+            print *, "Run: python prepare_climate_streaming.py"
+            stop 1
+        endif
+        read(10) gpu_train_inputs
+        close(10)
+
+        open(unit=10, file=DATA_DIR//'outputs_train_stream.bin', form='unformatted', &
+             access='stream', status='old')
+        read(10) gpu_train_outputs
+        close(10)
+
+        print '(A,I8,A)', "   Loaded ", train_samples, " training pairs"
+
+        print *, ""
+        print *, "Loading test data..."
+
+        open(unit=10, file=DATA_DIR//'inputs_test_stream.bin', form='unformatted', &
+             access='stream', status='old')
+        read(10) gpu_test_inputs
+        close(10)
+
+        open(unit=10, file=DATA_DIR//'outputs_test_stream.bin', form='unformatted', &
+             access='stream', status='old')
+        read(10) gpu_test_outputs
+        close(10)
+
+        print '(A,I8,A)', "   Loaded ", test_samples, " test pairs"
+
+        print *, ""
+        print *, "Dataset loaded successfully!"
+
+    end subroutine load_dataset_full_ram
+
+    !================================================================
+    ! Load in Streaming Mode (uses regression streaming loader)
+    !================================================================
+    subroutine load_dataset_streaming()
+        integer :: stat
+        integer :: batch_size
+
+        batch_size = DEFAULT_BATCH_SIZE
+
+        ! Initialize regression streaming loader for paired input/output
+        call regression_streaming_init( &
+            DATA_DIR//'inputs_train_stream.bin', &
+            DATA_DIR//'outputs_train_stream.bin', &
+            int(train_samples, 8), &
+            input_size, &
+            batch_size)
+
+        call regression_streaming_set_shuffle_mode(REG_SHUFFLE_BLOCK, 50)
+
+        ! Load test data into memory (needed for evaluation)
+        print *, ""
+        print *, "Loading test data into memory..."
+
+        allocate(gpu_test_inputs(test_samples, input_size), stat=stat)
+        allocate(gpu_test_outputs(test_samples, output_size), stat=stat)
+
+        open(unit=10, file=DATA_DIR//'inputs_test_stream.bin', form='unformatted', &
+             access='stream', status='old', iostat=stat)
+        if (stat /= 0) then
+            print *, "ERROR: Cannot open test inputs"
+            print *, "Expected file: ", DATA_DIR//'inputs_test_stream.bin'
+            stop 1
+        endif
+        read(10) gpu_test_inputs
+        close(10)
+
+        open(unit=10, file=DATA_DIR//'outputs_test_stream.bin', form='unformatted', &
+             access='stream', status='old')
+        read(10) gpu_test_outputs
+        close(10)
+
+        print '(A,I8,A)', "   Loaded ", test_samples, " test pairs"
+        print '(A,F6.2,A)', "   Test data: ", &
+              real(int(test_samples,8) * int(input_size,8) * 4 * 2) / (1024.0**3), " GB"
+
+        print *, ""
+        print *, "Streaming mode ready!"
+
+    end subroutine load_dataset_streaming
+
+    !================================================================
+    ! Start new epoch (for streaming mode)
+    !================================================================
+    subroutine dataset_start_epoch()
+        if (streaming_mode_active) then
+            call regression_streaming_start_epoch()
+        endif
+    end subroutine dataset_start_epoch
+
+    !================================================================
+    ! Get next batch (for streaming mode)
+    !================================================================
+    subroutine dataset_get_batch(batch_inputs, batch_outputs, actual_size)
+        real(4), managed, intent(out) :: batch_inputs(:,:)
+        real(4), managed, intent(out) :: batch_outputs(:,:)
+        integer, intent(out) :: actual_size
+
+        if (streaming_mode_active) then
+            call regression_streaming_get_batch(batch_inputs, batch_outputs, actual_size)
+        else
+            ! For full RAM mode, caller handles batching directly
+            actual_size = 0
+        endif
+    end subroutine dataset_get_batch
+
+    !================================================================
+    ! Check if data is loaded
+    !================================================================
+    function is_data_loaded() result(loaded)
+        logical :: loaded
+        loaded = data_loaded
+    end function is_data_loaded
+
+    !================================================================
+    ! Cleanup
+    !================================================================
+    subroutine dataset_cleanup()
+        if (streaming_mode_active) then
+            call regression_streaming_cleanup()
+        endif
+
+        if (allocated(gpu_train_inputs)) deallocate(gpu_train_inputs)
+        if (allocated(gpu_train_outputs)) deallocate(gpu_train_outputs)
+        if (allocated(gpu_test_inputs)) deallocate(gpu_test_inputs)
+        if (allocated(gpu_test_outputs)) deallocate(gpu_test_outputs)
+
+    end subroutine dataset_cleanup
+
+end module dataset_config

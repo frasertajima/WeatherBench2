@@ -1,0 +1,288 @@
+!================================================================
+! Training Step Export Module
+!================================================================
+! Exports all data needed to verify one training step against PyTorch:
+!   - Initial weights (before update)
+!   - Input batch and target batch
+!   - Forward pass output
+!   - Loss value
+!   - Gradients (after backward pass)
+!   - Updated weights (after Adam step)
+!
+! This allows bit-for-bit verification of:
+!   1. Forward pass correctness
+!   2. Loss computation
+!   3. Backward pass (gradient computation)
+!   4. Adam optimizer update
+!
+! Author: v28e Climate CNN Team
+! Date: 2025-11-23
+!================================================================
+
+module training_export
+    use cudafor
+    use iso_c_binding
+    use climate_unet_module
+    use conv2d_cudnn
+    use unet_blocks
+    implicit none
+
+    private
+    public :: export_training_step_data
+    public :: export_conv2d_gradients
+    public :: export_encoder_gradients
+    public :: export_decoder_gradients
+
+contains
+
+    !================================================================
+    ! Export 4D array to binary file
+    !================================================================
+    subroutine export_4d_array(array, filename)
+        real(4), device, intent(in) :: array(:,:,:,:)
+        character(len=*), intent(in) :: filename
+
+        real(4), allocatable :: host_array(:,:,:,:)
+        integer :: dims(4)
+
+        dims = shape(array)
+        allocate(host_array(dims(1), dims(2), dims(3), dims(4)))
+        host_array = array
+
+        open(unit=99, file=filename, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+
+        deallocate(host_array)
+    end subroutine export_4d_array
+
+    !================================================================
+    ! Export 1D array to binary file
+    !================================================================
+    subroutine export_1d_array(array, filename)
+        real(4), device, intent(in) :: array(:)
+        character(len=*), intent(in) :: filename
+
+        real(4), allocatable :: host_array(:)
+        integer :: n
+
+        n = size(array)
+        allocate(host_array(n))
+        host_array = array
+
+        open(unit=99, file=filename, form='unformatted', access='stream', status='replace')
+        write(99) host_array
+        close(99)
+
+        deallocate(host_array)
+    end subroutine export_1d_array
+
+    !================================================================
+    ! Export scalar to text file
+    !================================================================
+    subroutine export_scalar(value, filename)
+        real(4), intent(in) :: value
+        character(len=*), intent(in) :: filename
+
+        open(unit=99, file=filename, status='replace')
+        write(99, '(E20.12)') value
+        close(99)
+    end subroutine export_scalar
+
+    !================================================================
+    ! Export conv2d layer gradients
+    !================================================================
+    subroutine export_conv2d_gradients(layer, export_dir, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: export_dir, prefix
+
+        character(len=512) :: filepath
+
+        ! Export weight gradients
+        filepath = trim(export_dir) // trim(prefix) // "_grad_weights.bin"
+        call export_4d_array(layer%grad_weights, filepath)
+
+        ! Export bias gradients
+        filepath = trim(export_dir) // trim(prefix) // "_grad_bias.bin"
+        call export_1d_array(layer%grad_bias, filepath)
+
+        ! Export Adam momentum (m)
+        filepath = trim(export_dir) // trim(prefix) // "_m_weights.bin"
+        call export_4d_array(layer%m_weights, filepath)
+
+        filepath = trim(export_dir) // trim(prefix) // "_m_bias.bin"
+        call export_1d_array(layer%m_bias, filepath)
+
+        ! Export Adam velocity (v)
+        filepath = trim(export_dir) // trim(prefix) // "_v_weights.bin"
+        call export_4d_array(layer%v_weights, filepath)
+
+        filepath = trim(export_dir) // trim(prefix) // "_v_bias.bin"
+        call export_1d_array(layer%v_bias, filepath)
+
+    end subroutine export_conv2d_gradients
+
+    !================================================================
+    ! Export encoder block gradients
+    !================================================================
+    subroutine export_encoder_gradients(block, export_dir, prefix)
+        type(encoder_block_t), intent(in) :: block
+        character(len=*), intent(in) :: export_dir, prefix
+
+        call export_conv2d_gradients(block%conv1, export_dir, trim(prefix)//"_conv1")
+        call export_conv2d_gradients(block%conv2, export_dir, trim(prefix)//"_conv2")
+
+    end subroutine export_encoder_gradients
+
+    !================================================================
+    ! Export decoder block gradients
+    !================================================================
+    subroutine export_decoder_gradients(block, export_dir, prefix)
+        type(decoder_block_t), intent(in) :: block
+        character(len=*), intent(in) :: export_dir, prefix
+
+        call export_conv2d_gradients(block%conv1, export_dir, trim(prefix)//"_conv1")
+        call export_conv2d_gradients(block%conv2, export_dir, trim(prefix)//"_conv2")
+
+    end subroutine export_decoder_gradients
+
+    !================================================================
+    ! Export all training step data for verification
+    ! Call this after forward, backward, and update to get complete state
+    !================================================================
+    subroutine export_training_step_data(model, input, target, output, grad_output, &
+                                         loss, learning_rate, timestep, export_dir)
+        type(climate_unet_t), intent(in) :: model
+        real(4), device, intent(in) :: input(:,:,:,:)       ! (W,H,C,N)
+        real(4), device, intent(in) :: target(:,:,:,:)      ! (W,H,C,N)
+        real(4), device, intent(in) :: output(:,:,:,:)      ! (W,H,C,N)
+        real(4), device, intent(in) :: grad_output(:,:,:,:) ! (W,H,C,N)
+        real(4), intent(in) :: loss
+        real(4), intent(in) :: learning_rate
+        integer, intent(in) :: timestep
+        character(len=*), intent(in) :: export_dir
+
+        character(len=256) :: cmd
+        character(len=512) :: filepath
+
+        ! Create export directory
+        cmd = "mkdir -p " // trim(export_dir)
+        call system(trim(cmd))
+
+        print *, ""
+        print *, "======================================================================"
+        print *, "Exporting Training Step Data for Verification"
+        print *, "======================================================================"
+        print *, "  Export directory: ", trim(export_dir)
+        print *, "  Learning rate:    ", learning_rate
+        print *, "  Timestep:         ", timestep
+        print *, "  Loss:             ", loss
+
+        ! Export input and target batch
+        print *, "  Exporting input/target batch..."
+        filepath = trim(export_dir) // "input_batch.bin"
+        call export_4d_array(input, filepath)
+        filepath = trim(export_dir) // "target_batch.bin"
+        call export_4d_array(target, filepath)
+
+        ! Export forward pass output
+        print *, "  Exporting forward output..."
+        filepath = trim(export_dir) // "forward_output.bin"
+        call export_4d_array(output, filepath)
+
+        ! Export loss gradient (dL/dOutput)
+        print *, "  Exporting loss gradient..."
+        filepath = trim(export_dir) // "grad_output.bin"
+        call export_4d_array(grad_output, filepath)
+
+        ! Export loss value
+        filepath = trim(export_dir) // "loss.txt"
+        call export_scalar(loss, filepath)
+
+        ! Export hyperparameters
+        filepath = trim(export_dir) // "hyperparams.txt"
+        open(unit=99, file=filepath, status='replace')
+        write(99, '(A,E20.12)') "learning_rate: ", learning_rate
+        write(99, '(A,I0)') "timestep: ", timestep
+        write(99, '(A,E20.12)') "adam_beta1: ", 0.9
+        write(99, '(A,E20.12)') "adam_beta2: ", 0.999
+        write(99, '(A,E20.12)') "adam_epsilon: ", 1.0e-8
+        close(99)
+
+        ! Export updated weights (after Adam step)
+        print *, "  Exporting updated weights..."
+
+        ! Encoders
+        call export_conv2d_weights_only(model%enc1%conv1, export_dir, "enc1_conv1")
+        call export_conv2d_weights_only(model%enc1%conv2, export_dir, "enc1_conv2")
+        call export_conv2d_weights_only(model%enc2%conv1, export_dir, "enc2_conv1")
+        call export_conv2d_weights_only(model%enc2%conv2, export_dir, "enc2_conv2")
+        call export_conv2d_weights_only(model%enc3%conv1, export_dir, "enc3_conv1")
+        call export_conv2d_weights_only(model%enc3%conv2, export_dir, "enc3_conv2")
+
+        ! Bottleneck
+        call export_conv2d_weights_only(model%bottleneck1, export_dir, "bottleneck1")
+        call export_conv2d_weights_only(model%bottleneck2, export_dir, "bottleneck2")
+
+        ! Decoders
+        call export_conv2d_weights_only(model%dec3%conv1, export_dir, "dec3_conv1")
+        call export_conv2d_weights_only(model%dec3%conv2, export_dir, "dec3_conv2")
+        call export_conv2d_weights_only(model%dec2%conv1, export_dir, "dec2_conv1")
+        call export_conv2d_weights_only(model%dec2%conv2, export_dir, "dec2_conv2")
+        call export_conv2d_weights_only(model%dec1%conv1, export_dir, "dec1_conv1")
+        call export_conv2d_weights_only(model%dec1%conv2, export_dir, "dec1_conv2")
+
+        ! Final conv
+        call export_conv2d_weights_only(model%final_conv, export_dir, "final")
+
+        ! Export gradients and Adam state
+        print *, "  Exporting gradients and Adam state..."
+
+        ! Encoders
+        call export_conv2d_gradients(model%enc1%conv1, export_dir, "enc1_conv1")
+        call export_conv2d_gradients(model%enc1%conv2, export_dir, "enc1_conv2")
+        call export_conv2d_gradients(model%enc2%conv1, export_dir, "enc2_conv1")
+        call export_conv2d_gradients(model%enc2%conv2, export_dir, "enc2_conv2")
+        call export_conv2d_gradients(model%enc3%conv1, export_dir, "enc3_conv1")
+        call export_conv2d_gradients(model%enc3%conv2, export_dir, "enc3_conv2")
+
+        ! Bottleneck
+        call export_conv2d_gradients(model%bottleneck1, export_dir, "bottleneck1")
+        call export_conv2d_gradients(model%bottleneck2, export_dir, "bottleneck2")
+
+        ! Decoders
+        call export_conv2d_gradients(model%dec3%conv1, export_dir, "dec3_conv1")
+        call export_conv2d_gradients(model%dec3%conv2, export_dir, "dec3_conv2")
+        call export_conv2d_gradients(model%dec2%conv1, export_dir, "dec2_conv1")
+        call export_conv2d_gradients(model%dec2%conv2, export_dir, "dec2_conv2")
+        call export_conv2d_gradients(model%dec1%conv1, export_dir, "dec1_conv1")
+        call export_conv2d_gradients(model%dec1%conv2, export_dir, "dec1_conv2")
+
+        ! Final conv
+        call export_conv2d_gradients(model%final_conv, export_dir, "final")
+
+        print *, "======================================================================"
+        print *, "Training step export complete!"
+        print *, "======================================================================"
+        print *, ""
+
+    end subroutine export_training_step_data
+
+    !================================================================
+    ! Export only weights (not gradients) - for initial state
+    !================================================================
+    subroutine export_conv2d_weights_only(layer, export_dir, prefix)
+        type(conv2d_layer_t), intent(in) :: layer
+        character(len=*), intent(in) :: export_dir, prefix
+
+        character(len=512) :: filepath
+
+        filepath = trim(export_dir) // trim(prefix) // "_weights.bin"
+        call export_4d_array(layer%weights, filepath)
+
+        filepath = trim(export_dir) // trim(prefix) // "_bias.bin"
+        call export_1d_array(layer%bias, filepath)
+
+    end subroutine export_conv2d_weights_only
+
+end module training_export
