@@ -1,0 +1,6 @@
+learning_rate:   0.999999974738E-04
+timestep: 1
+batch_size: 8
+adam_beta1:   0.899999976158E+00
+adam_beta2:   0.999000012875E+00
+adam_epsilon:   0.999999993923E-08

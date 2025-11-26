@@ -1,0 +1,4 @@
+forward_ms:       27.108
+backward_ms:       92.842
+update_ms:        0.297
+total_gpu_ms:      120.248

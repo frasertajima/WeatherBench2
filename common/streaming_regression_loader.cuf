@@ -1,5 +1,5 @@
 !================================================================
-! Streaming Regression Data Loader Module - v28d
+! Streaming Regression Data Loader Module - v28e
 !================================================================
 ! Variant of streaming_data_loader for REGRESSION tasks where
 ! both inputs and outputs are continuous float arrays of the
@@ -16,8 +16,8 @@
 !   3. call regression_streaming_get_batch(batch_in, batch_out, n)
 !   4. call regression_streaming_cleanup()
 !
-! Author: v28d Streaming Team
-! Date: 2025-11-22
+! Author: v28e Climate CNN Team
+! Date: 2025-11-25
 !================================================================
 module streaming_regression_loader
     use cudafor

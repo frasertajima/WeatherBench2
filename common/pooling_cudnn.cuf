@@ -203,8 +203,12 @@ contains
         real(4), device, intent(in) :: input(*)
         real(4), device, intent(out) :: output(*)
 
-        real(4), target :: alpha = 1.0, beta = 0.0
+        real(4), target :: alpha, beta
         integer :: stat
+
+        ! CRITICAL FIX: Initialize on every call
+        alpha = 1.0
+        beta = 0.0
 
         stat = cudnnPoolingForward(layer%cudnn_handle, layer%pooling_desc, &
                                    c_loc(alpha), layer%input_desc, c_loc(input), &
@@ -226,8 +230,12 @@ contains
         real(4), device, intent(in) :: grad_output(*) ! Gradient from next layer
         real(4), device, intent(out) :: grad_input(*) ! Gradient to previous layer
 
-        real(4), target :: alpha = 1.0, beta = 0.0
+        real(4), target :: alpha, beta
         integer :: stat
+
+        ! CRITICAL FIX: Initialize on every call
+        alpha = 1.0
+        beta = 0.0
 
         stat = cudnnPoolingBackward(layer%cudnn_handle, layer%pooling_desc, &
                                     c_loc(alpha), layer%output_desc, c_loc(output), &

@@ -1,40 +1,30 @@
-# Compiled files
+# Large data files - users should download themselves
+climate_data_streaming/
+saved_models/
+data/
+
+# Build artifacts
 *.o
 *.mod
 *.a
-
-# Executables
+climate_train_unet
 test_conv2d
 test_pooling
 test_unet_blocks
 test_climate_unet
 test_training_step
-climate_train_unet
 
 # Python
 __pycache__/
 *.pyc
-*.pyo
 .ipynb_checkpoints/
-
-# Data files (users provide their own)
-data/climate_data_streaming/
-
-# Training outputs
-saved_models/
-training_verify/
-*.log
-
-# Jupyter outputs
-notebooks/*.png
 
 # IDE
 .vscode/
 .idea/
 *.swp
-*.swo
 *~
 
-# System
+# OS
 .DS_Store
 Thumbs.db

@@ -1,5 +1,5 @@
 !================================================================
-! Command Line Arguments Module - v28d
+! Command Line Arguments Module - v28e
 !================================================================
 ! Simple command-line argument parsing for training options.
 !
@@ -14,8 +14,8 @@
 !   --stream    Enable streaming mode (for huge datasets)
 !   --help      Show help message
 !
-! Author: v28d Streaming Team
-! Date: 2025-11-21
+! Author: v28e Climate CNN Team
+! Date: 2025-11-25
 !================================================================
 module cmdline_args
     implicit none

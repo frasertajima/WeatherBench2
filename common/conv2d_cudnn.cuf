@@ -492,8 +492,13 @@ contains
         real(4), device, intent(in) :: input(*)
         real(4), device, intent(out) :: output(*)
 
-        real(4), target :: alpha = 1.0, beta = 0.0
+        real(4), target :: alpha, beta
         integer :: stat
+
+        ! CRITICAL FIX: Initialize alpha and beta on EVERY call
+        ! (not just first call - Fortran SAVE semantics!)
+        alpha = 1.0
+        beta = 0.0
 
         ! Convolution: output = weights * input
         stat = cudnnConvolutionForward(layer%cudnn_handle, c_loc(alpha), &
@@ -547,11 +552,15 @@ contains
         real(4), device, intent(out) :: grad_input(*)  ! Gradient to previous layer
         logical, intent(in), optional :: compute_grad_input
 
-        real(4), target :: alpha = 1.0, beta = 0.0
+        real(4), target :: alpha, beta
         integer :: stat
         logical :: do_grad_input
         real(4), device, allocatable :: grad_pre_relu(:)
         integer :: out_size
+
+        ! CRITICAL FIX: Initialize on every call
+        alpha = 1.0
+        beta = 0.0
 
         do_grad_input = .true.
         if (present(compute_grad_input)) do_grad_input = compute_grad_input
